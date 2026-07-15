@@ -323,6 +323,21 @@ export class MongoDbVectorSearch implements INodeType {
 				description: 'Number of results to return.',
 			},
 			{
+				displayName: 'Similarity Threshold',
+				name: 'similarityThreshold',
+				type: 'number',
+				typeOptions: {
+					numberPrecision: 4,
+				},
+				displayOptions: {
+					show: {
+						operation: ['vectorSearch'],
+					},
+				},
+				default: 0,
+				description: 'Only return results with a similarity score greater than or equal to this threshold. Set to 0 to disable.',
+			},
+			{
 				displayName: 'Filter',
 				name: 'filter',
 				type: 'string',
@@ -848,6 +863,17 @@ export class MongoDbVectorSearch implements INodeType {
 						}
 					}
 
+					// If similarity score is excluded in options, but was needed for matching the threshold, exclude it from final projection
+					const similarityThreshold = this.getNodeParameter('similarityThreshold', i, 0) as number;
+					if (!includeScore && similarityThreshold > 0) {
+						if (projectionMode === 'all' || projectionMode === 'exclude') {
+							optionsProject[scoreFieldName] = 0;
+							forceProject = true;
+						} else if (projectionMode === 'include') {
+							delete optionsProject[scoreFieldName];
+						}
+					}
+
 					let queryVector: number[];
 					const queryType = this.getNodeParameter('queryType', i, 'vector') as string;
 
@@ -913,10 +939,20 @@ export class MongoDbVectorSearch implements INodeType {
 						},
 					];
 
-					if (includeScore) {
+					// We need the score field if includeScore is true OR if a similarity threshold is specified
+					if (includeScore || similarityThreshold > 0) {
 						pipeline.push({
 							$addFields: {
 								[scoreFieldName]: { $meta: 'vectorSearchScore' },
+							},
+						});
+					}
+
+					// Add match stage for threshold if set
+					if (similarityThreshold > 0) {
+						pipeline.push({
+							$match: {
+								[scoreFieldName]: { $gte: similarityThreshold },
 							},
 						});
 					}
