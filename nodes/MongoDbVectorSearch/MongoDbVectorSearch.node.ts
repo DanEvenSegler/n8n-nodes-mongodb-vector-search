@@ -872,6 +872,14 @@ export class MongoDbVectorSearch implements INodeType {
 						},
 					];
 
+					if (includeScore) {
+						pipeline.push({
+							$addFields: {
+								[scoreFieldName]: { $meta: 'vectorSearchScore' },
+							},
+						});
+					}
+
 					const projectStage: any = {};
 					if (projectRaw && projectRaw.trim() !== '') {
 						const proj = parseJson(this, projectRaw, 'Project', jsonFormatting);
@@ -882,8 +890,12 @@ export class MongoDbVectorSearch implements INodeType {
 						Object.assign(projectStage, optionsProject);
 					}
 
-					if (includeScore) {
-						projectStage[scoreFieldName] = { $meta: 'vectorSearchScore' };
+					// Auto-include similarity score if an inclusion projection is defined
+					if (includeScore && Object.keys(projectStage).length > 0) {
+						const isInclusion = Object.values(projectStage).some(val => val === 1 || val === true);
+						if (isInclusion) {
+							projectStage[scoreFieldName] = 1;
+						}
 					}
 
 					if (Object.keys(projectStage).length > 0) {
