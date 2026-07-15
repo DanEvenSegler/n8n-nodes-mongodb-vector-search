@@ -159,7 +159,7 @@ export class MongoDbVectorSearch implements INodeType {
 		defaults: {
 			name: 'MongoDB Vector Search',
 		},
-		inputs: ['main'],
+		inputs: ['main', 'ai_embedding'],
 		outputs: ['main'],
 		credentials: [
 			{
@@ -219,7 +219,11 @@ export class MongoDbVectorSearch implements INodeType {
 			{
 				displayName: 'Index Name',
 				name: 'indexName',
-				type: 'string',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getSearchIndexes',
+					loadOptionsDependsOn: ['database', 'collection'],
+				},
 				required: true,
 				displayOptions: {
 					show: {
@@ -227,7 +231,7 @@ export class MongoDbVectorSearch implements INodeType {
 					},
 				},
 				default: 'default',
-				description: 'Name of the MongoDB Atlas Vector Search index.',
+				description: 'Select the Vector Search index from the dropdown. If you want to use expressions, toggle the expression button.',
 			},
 			{
 				displayName: 'Embedding Field',
@@ -243,6 +247,44 @@ export class MongoDbVectorSearch implements INodeType {
 				description: 'The document field containing vector embeddings (array of numbers).',
 			},
 			{
+				displayName: 'Query Input Type',
+				name: 'queryType',
+				type: 'options',
+				displayOptions: {
+					show: {
+						operation: ['vectorSearch'],
+					},
+				},
+				options: [
+					{
+						name: 'Direct Vector Input',
+						value: 'vector',
+						description: 'Provide query vector directly as a JSON array of numbers',
+					},
+					{
+						name: 'Embedding Model (Sub-Node)',
+						value: 'prompt',
+						description: 'Use a connected embedding model sub-node to generate vector from prompt text',
+					},
+				],
+				default: 'vector',
+				description: 'How to supply the search query vector.',
+			},
+			{
+				displayName: 'Prompt Text',
+				name: 'prompt',
+				type: 'string',
+				required: true,
+				displayOptions: {
+					show: {
+						operation: ['vectorSearch'],
+						queryType: ['prompt'],
+					},
+				},
+				default: '',
+				description: 'The text prompt to convert to an embedding vector using the connected sub-node.',
+			},
+			{
 				displayName: 'Query Vector',
 				name: 'queryVector',
 				type: 'string',
@@ -250,6 +292,7 @@ export class MongoDbVectorSearch implements INodeType {
 				displayOptions: {
 					show: {
 						operation: ['vectorSearch'],
+						queryType: ['vector'],
 					},
 				},
 				default: '',
@@ -562,6 +605,42 @@ export class MongoDbVectorSearch implements INodeType {
 				results.sort((a, b) => a.name.localeCompare(b.name));
 				return results;
 			},
+
+			async getSearchIndexes(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				const dbName = this.getCurrentNodeParameter('database') as string;
+				const collectionName = this.getCurrentNodeParameter('collection') as string;
+
+				if (!dbName || !collectionName) {
+					return [];
+				}
+
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const db = client.db(dbName);
+					const collection = db.collection(collectionName);
+					const cursor = collection.listSearchIndexes();
+					for await (const idx of cursor) {
+						results.push({
+							name: idx.name,
+							value: idx.name,
+						});
+					}
+				} catch (e) {
+					// Fallback for non-Atlas or permission restrictions
+				}
+
+				if (results.length === 0) {
+					results.push({
+						name: 'default',
+						value: 'default',
+					});
+				}
+
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
 		},
 	};
 
@@ -611,18 +690,46 @@ export class MongoDbVectorSearch implements INodeType {
 					const indexName = this.getNodeParameter('indexName', i) as string;
 					const embeddingField = this.getNodeParameter('embeddingField', i) as string;
 
-					const queryVectorRaw = this.getNodeParameter('queryVector', i) as string | number[];
 					let queryVector: number[];
-					if (typeof queryVectorRaw === 'string') {
-						try {
-							queryVector = JSON.parse(queryVectorRaw) as number[];
-						} catch (e) {
-							throw new NodeOperationError(this.getNode(), 'Query Vector must be a valid JSON array of numbers.');
+					const queryType = this.getNodeParameter('queryType', i, 'vector') as string;
+
+					if (queryType === 'prompt') {
+						const promptText = this.getNodeParameter('prompt', i) as string;
+						const embedder = await this.getInputConnectionData('ai_embedding', i);
+						if (!embedder) {
+							throw new NodeOperationError(
+								this.getNode(),
+								'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI or Ollama) to the node\'s Embedding Model input port.'
+							);
 						}
-					} else if (Array.isArray(queryVectorRaw)) {
-						queryVector = queryVectorRaw;
+						const resolvedEmbedder = Array.isArray(embedder) ? embedder[0] : embedder;
+						if (typeof resolvedEmbedder.embedQuery !== 'function') {
+							throw new NodeOperationError(
+								this.getNode(),
+								'The connected node is not a valid Embedding Model (missing embedQuery function).'
+							);
+						}
+						try {
+							queryVector = await resolvedEmbedder.embedQuery(promptText);
+						} catch (error) {
+							throw new NodeOperationError(
+								this.getNode(),
+								`Failed to generate embedding vector: ${(error as Error).message}`
+							);
+						}
 					} else {
-						throw new NodeOperationError(this.getNode(), 'Query Vector must be an array of numbers.');
+						const queryVectorRaw = this.getNodeParameter('queryVector', i) as string | number[];
+						if (typeof queryVectorRaw === 'string') {
+							try {
+								queryVector = JSON.parse(queryVectorRaw) as number[];
+							} catch (e) {
+								throw new NodeOperationError(this.getNode(), 'Query Vector must be a valid JSON array of numbers.');
+							}
+						} else if (Array.isArray(queryVectorRaw)) {
+							queryVector = queryVectorRaw;
+						} else {
+							throw new NodeOperationError(this.getNode(), 'Query Vector must be an array of numbers.');
+						}
 					}
 
 					const numCandidates = this.getNodeParameter('numCandidates', i) as number;
