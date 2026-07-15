@@ -524,6 +524,94 @@ export class MongoDbVectorSearch implements INodeType {
 						},
 						description: 'Whether to include the similarity score in the output (as "_score").',
 					},
+					{
+						displayName: 'Score Field Name',
+						name: 'scoreFieldName',
+						type: 'string',
+						default: '_score',
+						displayOptions: {
+							show: {
+								'/operation': ['vectorSearch'],
+								'includeScore': [true],
+							},
+						},
+						description: 'The field name to output the similarity score under.',
+					},
+					{
+						displayName: 'Projection Mode',
+						name: 'projectionMode',
+						type: 'options',
+						options: [
+							{
+								name: 'Return All Fields',
+								value: 'all',
+							},
+							{
+								name: 'Include Only Specified Fields',
+								value: 'include',
+							},
+							{
+								name: 'Exclude Specified Fields',
+								value: 'exclude',
+							},
+						],
+						default: 'all',
+						description: 'Select how you want to filter/project the document fields.',
+					},
+					{
+						displayName: 'Fields to Include',
+						name: 'fieldsToInclude',
+						type: 'string',
+						required: true,
+						displayOptions: {
+							show: {
+								'projectionMode': ['include'],
+							},
+						},
+						default: '',
+						placeholder: 'title, description, price',
+						description: 'Comma-separated list of fields to include in the output.',
+					},
+					{
+						displayName: 'Fields to Exclude',
+						name: 'fieldsToExclude',
+						type: 'string',
+						required: true,
+						displayOptions: {
+							show: {
+								'projectionMode': ['exclude'],
+							},
+						},
+						default: '',
+						placeholder: 'internal_id, password_hash',
+						description: 'Comma-separated list of fields to exclude from the output.',
+					},
+					{
+						displayName: 'Exclude ID Field (_id)',
+						name: 'excludeId',
+						type: 'boolean',
+						default: false,
+						displayOptions: {
+							show: {
+								'projectionMode': ['all', 'include'],
+							},
+						},
+						description: 'Whether to exclude the default MongoDB _id field from the output.',
+					},
+					{
+						displayName: 'Query Timeout (MS)',
+						name: 'maxTimeMS',
+						type: 'number',
+						default: 30000,
+						description: 'The maximum execution time limit in milliseconds for the query.',
+					},
+					{
+						displayName: 'Explain Query',
+						name: 'explain',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to return the query execution plan (explanation) instead of the actual documents.',
+					},
 				],
 			},
 		],
@@ -682,6 +770,35 @@ export class MongoDbVectorSearch implements INodeType {
 				const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
 				const outputMode = (nodeOptions.outputMode as string) || 'separate';
 				const includeScore = nodeOptions.hasOwnProperty('includeScore') ? !!nodeOptions.includeScore : true;
+				const scoreFieldName = (nodeOptions.scoreFieldName as string) || '_score';
+				const projectionMode = (nodeOptions.projectionMode as string) || 'all';
+				const excludeId = !!nodeOptions.excludeId;
+				const maxTimeMS = nodeOptions.hasOwnProperty('maxTimeMS') ? nodeOptions.maxTimeMS as number : 30000;
+				const explain = !!nodeOptions.explain;
+
+				// Construct field projection mapping
+				const optionsProject: IDataObject = {};
+				if (projectionMode === 'include') {
+					const fields = (nodeOptions.fieldsToInclude as string || '')
+						.split(',')
+						.map(f => f.trim())
+						.filter(f => f !== '');
+					for (const f of fields) {
+						optionsProject[f] = 1;
+					}
+				} else if (projectionMode === 'exclude') {
+					const fields = (nodeOptions.fieldsToExclude as string || '')
+						.split(',')
+						.map(f => f.trim())
+						.filter(f => f !== '');
+					for (const f of fields) {
+						optionsProject[f] = 0;
+					}
+				}
+
+				if (excludeId) {
+					optionsProject._id = 0;
+				}
 
 				const operation = this.getNodeParameter('operation', i) as string;
 				let results: any[] = [];
@@ -761,15 +878,23 @@ export class MongoDbVectorSearch implements INodeType {
 						Object.assign(projectStage, proj);
 					}
 
+					if (Object.keys(optionsProject).length > 0) {
+						Object.assign(projectStage, optionsProject);
+					}
+
 					if (includeScore) {
-						projectStage._score = { $meta: 'vectorSearchScore' };
+						projectStage[scoreFieldName] = { $meta: 'vectorSearchScore' };
 					}
 
 					if (Object.keys(projectStage).length > 0) {
 						pipeline.push({ $project: projectStage });
 					}
 
-					results = await collection.aggregate(pipeline).toArray();
+					if (explain) {
+						results = [await collection.aggregate(pipeline, { maxTimeMS }).explain()];
+					} else {
+						results = await collection.aggregate(pipeline, { maxTimeMS }).toArray();
+					}
 
 				} else if (operation === 'find') {
 					const queryRaw = this.getNodeParameter('query', i, '{}') as string;
@@ -782,9 +907,18 @@ export class MongoDbVectorSearch implements INodeType {
 
 					let cursor = collection.find(query);
 
+					const projectStage: any = {};
 					if (projectRaw && projectRaw.trim() !== '') {
 						const project = parseJson(this, projectRaw, 'Project', jsonFormatting);
-						cursor = cursor.project(project);
+						Object.assign(projectStage, project);
+					}
+
+					if (Object.keys(optionsProject).length > 0) {
+						Object.assign(projectStage, optionsProject);
+					}
+
+					if (Object.keys(projectStage).length > 0) {
+						cursor = cursor.project(projectStage);
 					}
 
 					if (sortRaw && sortRaw.trim() !== '') {
@@ -800,7 +934,15 @@ export class MongoDbVectorSearch implements INodeType {
 						cursor = cursor.limit(limit);
 					}
 
-					results = await cursor.toArray();
+					if (maxTimeMS > 0) {
+						cursor = cursor.maxTimeMS(maxTimeMS);
+					}
+
+					if (explain) {
+						results = [await cursor.explain()];
+					} else {
+						results = await cursor.toArray();
+					}
 
 				} else if (operation === 'customSearch') {
 					const customType = this.getNodeParameter('customType', i) as string;
@@ -812,10 +954,20 @@ export class MongoDbVectorSearch implements INodeType {
 						const skip = this.getNodeParameter('skipCustom', i) as number;
 
 						let cursor = collection.find(query);
+						
+						if (Object.keys(optionsProject).length > 0) {
+							cursor = cursor.project(optionsProject);
+						}
+
 						if (skip > 0) cursor = cursor.skip(skip);
 						if (limit > 0) cursor = cursor.limit(limit);
+						if (maxTimeMS > 0) cursor = cursor.maxTimeMS(maxTimeMS);
 
-						results = await cursor.toArray();
+						if (explain) {
+							results = [await cursor.explain()];
+						} else {
+							results = await cursor.toArray();
+						}
 					} else {
 						const pipelineJson = this.getNodeParameter('pipelineJson', i, '[]') as string;
 						const pipeline = parseJson(this, pipelineJson, 'Pipeline JSON', jsonFormatting);
@@ -824,7 +976,11 @@ export class MongoDbVectorSearch implements INodeType {
 							throw new NodeOperationError(this.getNode(), 'Aggregation pipeline must be a JSON array of stages.');
 						}
 
-						results = await collection.aggregate(pipeline).toArray();
+						if (explain) {
+							results = [await collection.aggregate(pipeline, { maxTimeMS }).explain()];
+						} else {
+							results = await collection.aggregate(pipeline, { maxTimeMS }).toArray();
+						}
 					}
 				}
 
