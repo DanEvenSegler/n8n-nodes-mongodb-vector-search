@@ -5,6 +5,8 @@ import {
 	INodeType,
 	INodeTypeDescription,
 	NodeOperationError,
+	ILoadOptionsFunctions,
+	INodePropertyOptions,
 } from 'n8n-workflow';
 import { MongoClient, MongoClientOptions, ObjectId, BSON } from 'mongodb';
 import { createHash } from 'crypto';
@@ -193,17 +195,24 @@ export class MongoDbVectorSearch implements INodeType {
 			{
 				displayName: 'Database Name',
 				name: 'database',
-				type: 'string',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getDatabases',
+				},
 				default: '',
-				description: 'Override the database name defined in the credentials. If left empty, the credentials database name will be used.',
+				description: 'Select the database from the dropdown. If you want to use expressions, toggle the expression button.',
 			},
 			{
 				displayName: 'Collection Name',
 				name: 'collection',
-				type: 'string',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getCollections',
+					loadOptionsDependsOn: ['database'],
+				},
 				required: true,
 				default: '',
-				description: 'The name of the database collection to search.',
+				description: 'Select the collection from the dropdown. If you want to use expressions, toggle the expression button.',
 			},
 
 			// Vector Search parameters
@@ -475,6 +484,85 @@ export class MongoDbVectorSearch implements INodeType {
 				],
 			},
 		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getDatabases(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const adminDb = client.db().admin();
+					const dbInfo = await adminDb.listDatabases();
+					for (const db of dbInfo.databases) {
+						results.push({
+							name: db.name,
+							value: db.name,
+						});
+					}
+				} catch (e) {
+					// Fallback: use database defined in credentials if listDatabases fails (e.g. restricted permissions)
+					let defaultDb = credentials.database as string || '';
+					if (!defaultDb && credentials.configurationType === 'connectionString') {
+						const uri = credentials.connectionString as string;
+						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+						if (match) {
+							defaultDb = match[1];
+						}
+					}
+					if (defaultDb) {
+						results.push({
+							name: defaultDb,
+							value: defaultDb,
+						});
+					} else {
+						results.push({
+							name: 'admin',
+							value: 'admin',
+						});
+					}
+				}
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
+
+			async getCollections(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				let dbName = this.getCurrentNodeParameter('database') as string;
+				if (!dbName) {
+					dbName = credentials.database as string || '';
+					if (!dbName && credentials.configurationType === 'connectionString') {
+						const uri = credentials.connectionString as string;
+						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+						if (match) {
+							dbName = match[1];
+						}
+					}
+				}
+
+				if (!dbName) {
+					return [];
+				}
+
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const db = client.db(dbName);
+					const collections = await db.listCollections().toArray();
+					for (const col of collections) {
+						results.push({
+							name: col.name,
+							value: col.name,
+						});
+					}
+				} catch (e) {
+					// Return empty list if fetch fails
+				}
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
+		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
