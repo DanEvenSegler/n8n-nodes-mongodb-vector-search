@@ -599,6 +599,18 @@ export class MongoDbVectorSearch implements INodeType {
 						description: 'Whether to exclude the default MongoDB _id field from the output.',
 					},
 					{
+						displayName: 'Exclude Embedding Field',
+						name: 'excludeEmbedding',
+						type: 'boolean',
+						default: false,
+						displayOptions: {
+							show: {
+								'/operation': ['vectorSearch'],
+							},
+						},
+						description: 'Whether to exclude the large embedding vector array from the output to save memory.',
+					},
+					{
 						displayName: 'Query Timeout (MS)',
 						name: 'maxTimeMS',
 						type: 'number',
@@ -806,6 +818,16 @@ export class MongoDbVectorSearch implements INodeType {
 				if (operation === 'vectorSearch') {
 					const indexName = this.getNodeParameter('indexName', i) as string;
 					const embeddingField = this.getNodeParameter('embeddingField', i) as string;
+
+					// Exclude embedding field if requested
+					const excludeEmbedding = !!nodeOptions.excludeEmbedding;
+					if (excludeEmbedding) {
+						if (projectionMode === 'all' || projectionMode === 'exclude') {
+							optionsProject[embeddingField] = 0;
+						} else if (projectionMode === 'include') {
+							delete optionsProject[embeddingField];
+						}
+					}
 
 					let queryVector: number[];
 					const queryType = this.getNodeParameter('queryType', i, 'vector') as string;
