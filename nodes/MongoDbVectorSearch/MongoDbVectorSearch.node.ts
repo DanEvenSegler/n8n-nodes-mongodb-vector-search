@@ -6,8 +6,7 @@ import {
 	INodeTypeDescription,
 	NodeOperationError,
 } from 'n8n-workflow';
-import { MongoClient, MongoClientOptions, ObjectId } from 'mongodb';
-import { EJSON } from 'bson';
+import { MongoClient, MongoClientOptions, ObjectId, BSON } from 'mongodb';
 import { createHash } from 'crypto';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
@@ -104,7 +103,7 @@ function parseJson(node: any, jsonStr: string, fieldName: string, jsonFormatting
 	try {
 		if (jsonFormatting) {
 			// Use MongoDB's Extended JSON parser to support $oid, $date, etc.
-			return EJSON.parse(jsonStr);
+			return BSON.EJSON.parse(jsonStr);
 		} else {
 			return JSON.parse(jsonStr);
 		}
