@@ -477,6 +477,80 @@ export class MongoDbVectorSearch implements INodeType {
 				default: 0,
 				description: 'Number of records to skip.',
 			},
+			// Projection Settings
+			{
+				displayName: 'Projection Mode',
+				name: 'projectionMode',
+				type: 'options',
+				options: [
+					{
+						name: 'Return All Fields',
+						value: 'all',
+					},
+					{
+						name: 'Include Only Specified Fields',
+						value: 'include',
+					},
+					{
+						name: 'Exclude Specified Fields',
+						value: 'exclude',
+					},
+				],
+				default: 'all',
+				description: 'Select how you want to filter/project the document fields.',
+			},
+			{
+				displayName: 'Fields to Include',
+				name: 'fieldsToInclude',
+				type: 'string',
+				required: true,
+				displayOptions: {
+					show: {
+						projectionMode: ['include'],
+					},
+				},
+				default: '',
+				placeholder: 'title, description, price',
+				description: 'Comma-separated list of fields to include in the output.',
+			},
+			{
+				displayName: 'Fields to Exclude',
+				name: 'fieldsToExclude',
+				type: 'string',
+				required: true,
+				displayOptions: {
+					show: {
+						projectionMode: ['exclude'],
+					},
+				},
+				default: '',
+				placeholder: 'internal_id, password_hash',
+				description: 'Comma-separated list of fields to exclude from the output.',
+			},
+			{
+				displayName: 'Exclude ID Field (_id)',
+				name: 'excludeId',
+				type: 'boolean',
+				default: false,
+				displayOptions: {
+					show: {
+						projectionMode: ['all', 'include'],
+					},
+				},
+				description: 'Whether to exclude the default MongoDB _id field from the output.',
+			},
+			{
+				displayName: 'Exclude Embedding Field',
+				name: 'excludeEmbedding',
+				type: 'boolean',
+				default: false,
+				displayOptions: {
+					show: {
+						operation: ['vectorSearch'],
+					},
+				},
+				description: 'Whether to exclude the large embedding vector array from the output to save memory.',
+			},
 
 			// Additional Settings Group
 			{
@@ -536,79 +610,6 @@ export class MongoDbVectorSearch implements INodeType {
 							},
 						},
 						description: 'The field name to output the similarity score under.',
-					},
-					{
-						displayName: 'Projection Mode',
-						name: 'projectionMode',
-						type: 'options',
-						options: [
-							{
-								name: 'Return All Fields',
-								value: 'all',
-							},
-							{
-								name: 'Include Only Specified Fields',
-								value: 'include',
-							},
-							{
-								name: 'Exclude Specified Fields',
-								value: 'exclude',
-							},
-						],
-						default: 'all',
-						description: 'Select how you want to filter/project the document fields.',
-					},
-					{
-						displayName: 'Fields to Include',
-						name: 'fieldsToInclude',
-						type: 'string',
-						required: true,
-						displayOptions: {
-							show: {
-								'projectionMode': ['include'],
-							},
-						},
-						default: '',
-						placeholder: 'title, description, price',
-						description: 'Comma-separated list of fields to include in the output.',
-					},
-					{
-						displayName: 'Fields to Exclude',
-						name: 'fieldsToExclude',
-						type: 'string',
-						required: true,
-						displayOptions: {
-							show: {
-								'projectionMode': ['exclude'],
-							},
-						},
-						default: '',
-						placeholder: 'internal_id, password_hash',
-						description: 'Comma-separated list of fields to exclude from the output.',
-					},
-					{
-						displayName: 'Exclude ID Field (_id)',
-						name: 'excludeId',
-						type: 'boolean',
-						default: false,
-						displayOptions: {
-							show: {
-								'projectionMode': ['all', 'include'],
-							},
-						},
-						description: 'Whether to exclude the default MongoDB _id field from the output.',
-					},
-					{
-						displayName: 'Exclude Embedding Field',
-						name: 'excludeEmbedding',
-						type: 'boolean',
-						default: false,
-						displayOptions: {
-							show: {
-								'/operation': ['vectorSearch'],
-							},
-						},
-						description: 'Whether to exclude the large embedding vector array from the output to save memory.',
 					},
 					{
 						displayName: 'Query Timeout (MS)',
@@ -783,23 +784,33 @@ export class MongoDbVectorSearch implements INodeType {
 				const outputMode = (nodeOptions.outputMode as string) || 'separate';
 				const includeScore = nodeOptions.hasOwnProperty('includeScore') ? !!nodeOptions.includeScore : true;
 				const scoreFieldName = (nodeOptions.scoreFieldName as string) || '_score';
-				const projectionMode = (nodeOptions.projectionMode as string) || 'all';
-				const excludeId = !!nodeOptions.excludeId;
+				const projectionMode = this.getNodeParameter('projectionMode', i, 'all') as string;
+				const excludeId = this.getNodeParameter('excludeId', i, false) as boolean;
 				const maxTimeMS = nodeOptions.hasOwnProperty('maxTimeMS') ? nodeOptions.maxTimeMS as number : 30000;
 				const explain = !!nodeOptions.explain;
 
 				// Construct field projection mapping
 				const optionsProject: IDataObject = {};
+				let forceProject = false;
+
 				if (projectionMode === 'include') {
-					const fields = (nodeOptions.fieldsToInclude as string || '')
+					forceProject = true;
+					const fieldsToInclude = this.getNodeParameter('fieldsToInclude', i, '') as string;
+					const fields = fieldsToInclude
 						.split(',')
 						.map(f => f.trim())
 						.filter(f => f !== '');
 					for (const f of fields) {
 						optionsProject[f] = 1;
 					}
+					// If no fields are specified in inclusion mode, ensure we project _id so it doesn't return all fields
+					if (Object.keys(optionsProject).length === 0) {
+						optionsProject._id = excludeId ? 0 : 1;
+					}
 				} else if (projectionMode === 'exclude') {
-					const fields = (nodeOptions.fieldsToExclude as string || '')
+					forceProject = true;
+					const fieldsToExclude = this.getNodeParameter('fieldsToExclude', i, '') as string;
+					const fields = fieldsToExclude
 						.split(',')
 						.map(f => f.trim())
 						.filter(f => f !== '');
@@ -810,6 +821,7 @@ export class MongoDbVectorSearch implements INodeType {
 
 				if (excludeId) {
 					optionsProject._id = 0;
+					forceProject = true;
 				}
 
 				const operation = this.getNodeParameter('operation', i) as string;
@@ -820,12 +832,19 @@ export class MongoDbVectorSearch implements INodeType {
 					const embeddingField = this.getNodeParameter('embeddingField', i) as string;
 
 					// Exclude embedding field if requested
-					const excludeEmbedding = !!nodeOptions.excludeEmbedding;
+					const excludeEmbedding = this.getNodeParameter('excludeEmbedding', i, false) as boolean;
 					if (excludeEmbedding) {
 						if (projectionMode === 'all' || projectionMode === 'exclude') {
 							optionsProject[embeddingField] = 0;
+							forceProject = true;
 						} else if (projectionMode === 'include') {
 							delete optionsProject[embeddingField];
+						}
+					} else {
+						// If Exclude Embedding Field is OFF, and we are in 'include' mode,
+						// we should explicitly include the embedding field so it's not discarded by the inclusion projection!
+						if (projectionMode === 'include') {
+							optionsProject[embeddingField] = 1;
 						}
 					}
 
@@ -920,7 +939,7 @@ export class MongoDbVectorSearch implements INodeType {
 						}
 					}
 
-					if (Object.keys(projectStage).length > 0) {
+					if (Object.keys(projectStage).length > 0 || forceProject) {
 						pipeline.push({ $project: projectStage });
 					}
 
@@ -951,7 +970,7 @@ export class MongoDbVectorSearch implements INodeType {
 						Object.assign(projectStage, optionsProject);
 					}
 
-					if (Object.keys(projectStage).length > 0) {
+					if (Object.keys(projectStage).length > 0 || forceProject) {
 						cursor = cursor.project(projectStage);
 					}
 
@@ -989,7 +1008,7 @@ export class MongoDbVectorSearch implements INodeType {
 
 						let cursor = collection.find(query);
 						
-						if (Object.keys(optionsProject).length > 0) {
+						if (Object.keys(optionsProject).length > 0 || forceProject) {
 							cursor = cursor.project(optionsProject);
 						}
 
