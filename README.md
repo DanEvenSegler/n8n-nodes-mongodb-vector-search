@@ -62,17 +62,3 @@ Runs a native query or custom aggregation.
 - **Include Similarity Score**: Appends Atlas similarity score as `_score` in vector search results.
 
 ---
-
-## Author
-
-Created and maintained by:
-- **Author**: Dan Even segler
-- **Email**: [danevensegler08@gmail.com](mailto:danevensegler08@gmail.com)
-
-Feel free to reach out for contact or support.
-
----
-
-## License
-
-[MIT](LICENSE)
