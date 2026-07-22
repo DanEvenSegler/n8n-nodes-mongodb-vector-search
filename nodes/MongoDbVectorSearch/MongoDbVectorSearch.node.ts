@@ -1288,7 +1288,14 @@ export class MongoDbVectorSearch implements INodeType {
 					const queryType = this.getNodeParameter('queryType', i, 'vector') as string;
 
 					if (queryType === 'prompt') {
-						const promptText = this.getNodeParameter('prompt', i) as string;
+						const rawPromptText = this.getNodeParameter('prompt', i);
+						const promptText = extractQueryString(rawPromptText);
+						if (!promptText || promptText.trim() === '') {
+							throw new NodeOperationError(
+								this.getNode(),
+								'Prompt Text is empty or resolved to an invalid non-string value. Please ensure a valid text string is provided to generate an embedding vector.'
+							);
+						}
 						const embedder = await this.getInputConnectionData('ai_embedding', i);
 						if (!embedder) {
 							throw new NodeOperationError(
