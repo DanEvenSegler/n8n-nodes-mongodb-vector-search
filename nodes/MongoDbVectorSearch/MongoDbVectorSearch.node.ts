@@ -867,8 +867,9 @@ export class MongoDbVectorSearch implements INodeType {
 						displayName: 'Tool Name',
 						name: 'toolName',
 						type: 'string',
-						default: 'mongodb_vector_search',
-						description: 'The name of the tool as exposed to the AI Agent. Must be lowercase alphanumeric with underscores.',
+						default: '',
+						placeholder: 'search_my_collection',
+						description: 'Custom name of the tool as exposed to the AI Agent. If left empty, it will be automatically generated from the collection name (e.g. search_products). Must be lowercase alphanumeric with underscores.',
 					},
 					{
 						displayName: 'Tool Description',
@@ -879,7 +880,7 @@ export class MongoDbVectorSearch implements INodeType {
 						},
 						default: '',
 						placeholder: 'Use this tool to search the MongoDB vector database for relevant documents based on semantic similarity...',
-						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, an automatic description including the collection and database name will be generated.',
+						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, a description will be automatically generated from your database, collection, and field settings.',
 					},
 				],
 			},
@@ -1053,9 +1054,26 @@ export class MongoDbVectorSearch implements INodeType {
 		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
 		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
 
-		const toolName = (nodeOptions.toolName as string) || 'mongodb_vector_search';
-		const defaultDescription = `Use this tool to search the MongoDB collection "${collectionName}" in database "${dbName}" using vector similarity search. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string as input.`;
-		const toolDescription = (nodeOptions.toolDescription as string) || defaultDescription;
+		// Auto-generate tool name based on collection name if not specified by user
+		const sanitizedCol = (collectionName || 'vector_db')
+			.toLowerCase()
+			.replace(/[^a-z0-9_]/g, '_')
+			.replace(/_+/g, '_')
+			.replace(/^_|_$/g, '');
+		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'mongodb_vector_search';
+
+		const toolNameRaw = (nodeOptions.toolName as string) || '';
+		const toolName = toolNameRaw.trim() !== ''
+			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
+			: autoToolName;
+
+		// Auto-generate tool description based on dropdowns and field settings if not specified by user
+		const textInfo = textField ? ` (primary text field: "${textField}")` : '';
+		const filterInfo = filterRaw && filterRaw.trim() !== '' ? ` with pre-configured query filters` : '';
+		const autoDescription = `Use this tool to search the MongoDB collection "${collectionName}" (database: "${dbName}", index: "${indexName}")${textInfo} using vector similarity search${filterInfo}. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string describing what information you need to retrieve.`;
+
+		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
+		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
 
 		const vectorStore = new MongoDbAtlasVectorStore({
 			embeddings: embedder,
