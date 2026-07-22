@@ -327,7 +327,7 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 				for (const f of fields) {
 					projectStage[f] = 1;
 				}
-				if (this.textField && !fields.includes(this.textField)) {
+				if (this.textField && this.textField.trim() !== '' && !fields.includes(this.textField)) {
 					projectStage[this.textField] = 1;
 				}
 				if (Object.keys(projectStage).length === 0) {
@@ -372,7 +372,7 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			delete cleanedDoc._score;
 
 			let pageContent = '';
-			if (this.textField && cleanedDoc[this.textField] !== undefined && cleanedDoc[this.textField] !== null) {
+			if (this.textField && this.textField.trim() !== '' && cleanedDoc[this.textField] !== undefined && cleanedDoc[this.textField] !== null) {
 				const val = cleanedDoc[this.textField];
 				pageContent = typeof val === 'string' ? val : JSON.stringify(val);
 			}
@@ -533,8 +533,9 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 				displayName: 'Text Field Name',
 				name: 'textField',
 				type: 'string',
-				default: 'text',
-				description: 'The MongoDB document field containing the primary text content for AI Agent context. If empty or not found, the full document JSON will be used.',
+				default: '',
+				placeholder: 'text',
+				description: 'Optional MongoDB document field containing the primary text content. If left empty, all document fields will be formatted and returned to the AI Agent.',
 			},
 			{
 				displayName: 'Num Candidates',
@@ -811,7 +812,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		const collectionName = this.getNodeParameter('collection', itemIndex) as string;
 		const indexName = this.getNodeParameter('indexName', itemIndex, 'default') as string;
 		const embeddingField = this.getNodeParameter('embeddingField', itemIndex, 'embedding') as string;
-		const textField = this.getNodeParameter('textField', itemIndex, 'text') as string;
+		const textField = this.getNodeParameter('textField', itemIndex, '') as string;
 		const numCandidates = this.getNodeParameter('numCandidates', itemIndex, 100) as number;
 		const limit = this.getNodeParameter('limit', itemIndex, 10) as number;
 		const similarityThreshold = this.getNodeParameter('similarityThreshold', itemIndex, 0) as number;
@@ -854,7 +855,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 			: autoToolName;
 
 		// Auto-generate tool description based on dropdowns and field settings if not specified by user
-		const textInfo = textField ? ` (primary text field: "${textField}")` : '';
+		const textInfo = textField && textField.trim() !== '' ? ` (primary text field: "${textField.trim()}")` : '';
 		const filterInfo = filterRaw && filterRaw.trim() !== '' ? ` with pre-configured query filters` : '';
 		const autoDescription = `Use this tool to search the MongoDB collection "${collectionName}" (database: "${dbName}", index: "${indexName}")${textInfo} using vector similarity search${filterInfo}. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string describing what information you need to retrieve.`;
 
