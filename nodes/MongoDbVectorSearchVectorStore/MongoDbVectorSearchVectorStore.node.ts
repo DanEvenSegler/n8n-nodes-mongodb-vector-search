@@ -908,6 +908,104 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 	}
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-		return [this.helpers.returnJsonArray([])];
+		const items = this.getInputData();
+		const returnData: INodeExecutionData[] = [];
+
+		for (let i = 0; i < items.length; i++) {
+			try {
+				const credentials = await this.getCredentials('mongoDb', i);
+				const client = await getMongoClient(this, credentials);
+
+				let dbName = this.getNodeParameter('database', i, '') as string;
+				if (!dbName) {
+					dbName = (credentials.database as string) || '';
+					if (!dbName && credentials.configurationType === 'connectionString') {
+						const uri = credentials.connectionString as string;
+						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+						if (match) {
+							dbName = match[1];
+						}
+					}
+				}
+
+				if (!dbName) {
+					throw new NodeOperationError(
+						this.getNode(),
+						'Database name could not be resolved.'
+					);
+				}
+
+				const collectionName = this.getNodeParameter('collection', i) as string;
+				const indexName = this.getNodeParameter('indexName', i, 'default') as string;
+				const embeddingField = this.getNodeParameter('embeddingField', i, 'embedding') as string;
+				const textField = this.getNodeParameter('textField', i, '') as string;
+				const numCandidates = this.getNodeParameter('numCandidates', i, 100) as number;
+				const limit = this.getNodeParameter('limit', i, 10) as number;
+				const similarityThreshold = this.getNodeParameter('similarityThreshold', i, 0) as number;
+				const filterRaw = this.getNodeParameter('filter', i, '') as string;
+				const nodeOptions = this.getNodeParameter('options', i, {}) as IDataObject;
+				const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
+
+				let filterDefault: any = null;
+				if (filterRaw && filterRaw.trim() !== '') {
+					filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
+				}
+
+				let embedderRaw = await this.getInputConnectionData('ai_embedding', i);
+				if (Array.isArray(embedderRaw)) {
+					embedderRaw = embedderRaw[0];
+				}
+				const embedder = embedderRaw as EmbeddingsInterface;
+
+				const db = client.db(dbName);
+				const projectionMode = this.getNodeParameter('projectionMode', i, 'all') as string;
+				const fieldsToInclude = this.getNodeParameter('fieldsToInclude', i, '') as string;
+				const fieldsToExclude = this.getNodeParameter('fieldsToExclude', i, '') as string;
+				const excludeEmbedding = this.getNodeParameter('excludeEmbedding', i, false) as boolean;
+				const excludeId = this.getNodeParameter('excludeId', i, false) as boolean;
+
+				const vectorStore = new MongoDbAtlasVectorStore({
+					embeddings: embedder,
+					db,
+					collectionName,
+					indexName,
+					embeddingField,
+					textField,
+					numCandidates,
+					limit,
+					similarityThreshold,
+					filterDefault,
+					projectionOptions: {
+						projectionMode,
+						fieldsToInclude,
+						fieldsToExclude,
+						excludeEmbedding,
+						excludeId,
+					},
+				});
+
+				const queryText = items[i].json ? extractQueryString(items[i].json) : '';
+				if (queryText && embedder && typeof embedder.embedQuery === 'function') {
+					const docs = await vectorStore.similaritySearch(queryText, limit);
+					for (const doc of docs) {
+						returnData.push({
+							json: doc.metadata,
+							pairedItem: { item: i },
+						});
+					}
+				}
+			} catch (error) {
+				if (this.continueOnFail()) {
+					returnData.push({
+						json: { error: (error as Error).message },
+						pairedItem: { item: i },
+					});
+				} else {
+					throw error;
+				}
+			}
+		}
+
+		return [returnData];
 	}
 }
