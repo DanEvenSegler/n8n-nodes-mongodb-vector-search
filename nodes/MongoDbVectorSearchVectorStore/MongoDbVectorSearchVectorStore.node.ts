@@ -15,7 +15,6 @@ import { createHash } from 'crypto';
 import { VectorStore } from '@langchain/core/vectorstores';
 import { Document, DocumentInterface } from '@langchain/core/documents';
 import { EmbeddingsInterface } from '@langchain/core/embeddings';
-import { DynamicTool } from '@langchain/core/tools';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
 const clientCache: { [key: string]: MongoClient } = {};
@@ -232,6 +231,30 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 
 	_vectorstoreType(): string {
 		return 'mongodb';
+	}
+
+	async call(input: any): Promise<string> {
+		return this.func(input);
+	}
+
+	async invoke(input: any): Promise<string> {
+		return this.func(input);
+	}
+
+	async func(input: any): Promise<string> {
+		try {
+			const queryStr = extractQueryString(input);
+			if (!queryStr) {
+				return 'Please provide a non-empty search query string.';
+			}
+			const docs = await this.similaritySearch(queryStr, this.limit);
+			if (!docs || docs.length === 0) {
+				return `No matching documents found in MongoDB collection "${this.collectionName}" for search query "${queryStr}".`;
+			}
+			return docs.map((d) => d.pageContent).join('\n---\n');
+		} catch (err) {
+			return `Error executing MongoDB Vector Search tool: ${(err as Error).message}`;
+		}
 	}
 
 	async similaritySearchVectorWithScore(
@@ -859,32 +882,6 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 				excludeId,
 			},
 		});
-
-		const nodeOutputs = this.getNodeOutputs();
-		const connectedType = nodeOutputs?.[0]?.type || 'ai_vectorStore';
-
-		if (connectedType === 'ai_tool') {
-			const tool = new DynamicTool({
-				name: toolName,
-				description: toolDescription,
-				func: async (input: any) => {
-					try {
-						const queryStr = extractQueryString(input);
-						if (!queryStr) {
-							return 'Please provide a non-empty search query string.';
-						}
-						const docs = await vectorStore.similaritySearch(queryStr, limit);
-						if (!docs || docs.length === 0) {
-							return `No matching documents found in MongoDB collection "${collectionName}" for search query "${queryStr}".`;
-						}
-						return docs.map((d) => d.pageContent).join('\n---\n');
-					} catch (err) {
-						return `Error executing MongoDB Vector Search tool: ${(err as Error).message}`;
-					}
-				},
-			});
-			return { response: tool };
-		}
 
 		return { response: vectorStore };
 	}
