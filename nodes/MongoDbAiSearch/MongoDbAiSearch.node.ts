@@ -12,7 +12,8 @@ import {
 } from 'n8n-workflow';
 import { MongoClient, MongoClientOptions, ObjectId } from 'mongodb';
 import { createHash } from 'crypto';
-import { DynamicTool } from '@langchain/core/tools';
+import { z } from 'zod';
+import { DynamicStructuredTool } from '@langchain/core/tools';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
 const clientCache: { [key: string]: MongoClient } = {};
@@ -714,13 +715,22 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 			}
 		};
 
-		const tool = new DynamicTool({
+		const aiSearchSchema = z.object({
+			query: z.string().optional().describe('Text search prompt to fuzzy match fields or search query'),
+			filter: z.record(z.any()).optional().describe('MongoDB query filter object matching schema fields'),
+			id: z.string().optional().describe('Exact MongoDB document ID (_id)'),
+			skip: z.number().optional().describe('Number of records to skip for pagination'),
+			limit: z.number().optional().describe('Number of records to return'),
+			sort: z.record(z.any()).optional().describe('MongoDB sort document'),
+		});
+
+		const tool = new DynamicStructuredTool({
 			name: toolName,
 			description: toolDescription,
+			schema: aiSearchSchema,
 			func: toolFunc,
 		});
 
-		// Attach execution helper methods so tool works when invoked directly or via supplyData
 		(tool as any).call = toolFunc;
 		(tool as any).invoke = toolFunc;
 

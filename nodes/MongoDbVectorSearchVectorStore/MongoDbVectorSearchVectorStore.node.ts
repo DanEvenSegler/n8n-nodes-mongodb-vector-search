@@ -15,6 +15,8 @@ import { createHash } from 'crypto';
 import { VectorStore } from '@langchain/core/vectorstores';
 import { Document, DocumentInterface } from '@langchain/core/documents';
 import { EmbeddingsInterface } from '@langchain/core/embeddings';
+import { z } from 'zod';
+import { DynamicStructuredTool } from '@langchain/core/tools';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
 const clientCache: { [key: string]: MongoClient } = {};
@@ -999,6 +1001,30 @@ HOW TO CALL:
 				excludeId,
 			},
 		});
+
+		const vectorSearchSchema = z.object({
+			query: z.string().optional().describe('Search query text prompt for semantic vector search'),
+			filter: z.record(z.any()).optional().describe('MongoDB pre-filter object evaluated inside $vectorSearch stage'),
+			postFilter: z.record(z.any()).optional().describe('MongoDB post-filter object evaluated in $match stage after vector search'),
+			limit: z.number().optional().describe('Maximum number of search results to return'),
+		});
+
+		(vectorStore as any).schema = vectorSearchSchema;
+
+		const nodeOutputs = this.getNodeOutputs();
+		const isToolOutput = nodeOutputs.some((o: any) => o.type === 'ai_tool');
+
+		if (isToolOutput) {
+			const tool = new DynamicStructuredTool({
+				name: toolName,
+				description: toolDescription,
+				schema: vectorSearchSchema,
+				func: async (input: any) => vectorStore.func(input),
+			});
+			(tool as any).call = (input: any) => vectorStore.func(input);
+			(tool as any).invoke = (input: any) => vectorStore.func(input);
+			return { response: tool };
+		}
 
 		return { response: vectorStore };
 	}
