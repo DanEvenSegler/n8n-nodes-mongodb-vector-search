@@ -151,6 +151,33 @@ function cleanBsonTypes(obj: any): any {
 	return obj;
 }
 
+function extractQueryString(input: any): string {
+	if (input === null || input === undefined) return '';
+	if (typeof input === 'string') {
+		const trimmed = input.trim();
+		if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+			try {
+				const parsed = JSON.parse(trimmed);
+				return extractQueryString(parsed);
+			} catch (_) {
+				return trimmed;
+			}
+		}
+		return trimmed;
+	}
+	if (typeof input === 'object') {
+		if (typeof input.query === 'string') return input.query;
+		if (typeof input.input === 'string') return input.input;
+		if (typeof input.prompt === 'string') return input.prompt;
+		if (typeof input.search === 'string') return input.search;
+		if (typeof input.text === 'string') return input.text;
+		const strValues = Object.values(input).filter(v => typeof v === 'string');
+		if (strValues.length > 0) return strValues[0] as string;
+		return JSON.stringify(input);
+	}
+	return String(input);
+}
+
 export interface MongoDbVectorStoreOptions {
 	embeddings: EmbeddingsInterface;
 	db: any;
@@ -278,7 +305,15 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			}
 		}
 
-		const docs = await collection.aggregate(pipeline).toArray();
+		let docs: any[] = [];
+		try {
+			docs = await collection.aggregate(pipeline).toArray();
+		} catch (error) {
+			throw new NodeOperationError(
+				{ name: 'MongoDB Vector Search' } as any,
+				`MongoDB Vector Search pipeline failed on collection "${this.collectionName}": ${(error as Error).message}`
+			);
+		}
 		const results: [DocumentInterface, number][] = [];
 
 		for (const doc of docs) {
@@ -306,6 +341,18 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 		}
 
 		return results;
+	}
+
+	async similaritySearch(
+		query: string | any,
+		k?: number,
+		filter?: this['FilterType']
+	): Promise<DocumentInterface[]> {
+		const cleanQuery = extractQueryString(query);
+		if (!cleanQuery) return [];
+		const vector = await this.embeddings.embedQuery(cleanQuery);
+		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter);
+		return results.map(([doc]) => doc);
 	}
 
 	async addVectors(
@@ -1101,9 +1148,20 @@ export class MongoDbVectorSearch implements INodeType {
 			const tool = new DynamicTool({
 				name: toolName,
 				description: toolDescription,
-				func: async (input: string) => {
-					const docs = await vectorStore.similaritySearch(input, limit);
-					return docs.map(d => d.pageContent).join('\n---\n');
+				func: async (input: any) => {
+					try {
+						const queryStr = extractQueryString(input);
+						if (!queryStr) {
+							return 'Please provide a non-empty search query string.';
+						}
+						const docs = await vectorStore.similaritySearch(queryStr, limit);
+						if (!docs || docs.length === 0) {
+							return `No matching documents found in MongoDB collection "${collectionName}" for search query "${queryStr}".`;
+						}
+						return docs.map(d => d.pageContent).join('\n---\n');
+					} catch (err) {
+						return `Error executing MongoDB Vector Search tool: ${(err as Error).message}`;
+					}
 				},
 			});
 			return { response: tool };
