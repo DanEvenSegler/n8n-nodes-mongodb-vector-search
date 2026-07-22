@@ -7,9 +7,15 @@ import {
 	NodeOperationError,
 	ILoadOptionsFunctions,
 	INodePropertyOptions,
+	ISupplyDataFunctions,
+	SupplyData,
 } from 'n8n-workflow';
 import { MongoClient, MongoClientOptions, ObjectId, BSON } from 'mongodb';
 import { createHash } from 'crypto';
+import { VectorStore } from '@langchain/core/vectorstores';
+import { Document, DocumentInterface } from '@langchain/core/documents';
+import { EmbeddingsInterface } from '@langchain/core/embeddings';
+import { DynamicTool } from '@langchain/core/tools';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
 const clientCache: { [key: string]: MongoClient } = {};
@@ -145,6 +151,186 @@ function cleanBsonTypes(obj: any): any {
 	return obj;
 }
 
+export interface MongoDbVectorStoreOptions {
+	embeddings: EmbeddingsInterface;
+	db: any;
+	collectionName: string;
+	indexName: string;
+	embeddingField: string;
+	textField?: string;
+	numCandidates?: number;
+	limit?: number;
+	similarityThreshold?: number;
+	filterDefault?: any;
+	projectionOptions?: {
+		excludeEmbedding?: boolean;
+		excludeId?: boolean;
+	};
+}
+
+export class MongoDbAtlasVectorStore extends VectorStore {
+	declare FilterType: Record<string, any> | string;
+	private db: any;
+	private collectionName: string;
+	private indexName: string;
+	private embeddingField: string;
+	private textField: string;
+	private numCandidates: number;
+	private limit: number;
+	private similarityThreshold: number;
+	private filterDefault?: any;
+	private projectionOptions?: any;
+
+	constructor(options: MongoDbVectorStoreOptions) {
+		super(options.embeddings, {});
+		this.db = options.db;
+		this.collectionName = options.collectionName;
+		this.indexName = options.indexName;
+		this.embeddingField = options.embeddingField;
+		this.textField = options.textField || '';
+		this.numCandidates = options.numCandidates || 100;
+		this.limit = options.limit || 10;
+		this.similarityThreshold = options.similarityThreshold || 0;
+		this.filterDefault = options.filterDefault;
+		this.projectionOptions = options.projectionOptions;
+	}
+
+	_vectorstoreType(): string {
+		return 'mongodb';
+	}
+
+	async similaritySearchVectorWithScore(
+		query: number[],
+		k: number,
+		filter?: Record<string, any> | string
+	): Promise<[DocumentInterface, number][]> {
+		const collection = this.db.collection(this.collectionName);
+		const limitToUse = k || this.limit || 10;
+
+		const vectorSearchStage: any = {
+			index: this.indexName,
+			path: this.embeddingField,
+			queryVector: query,
+			numCandidates: Math.max(this.numCandidates || 100, limitToUse * 10),
+			limit: limitToUse,
+		};
+
+		let combinedFilter: any = null;
+		if (this.filterDefault && Object.keys(this.filterDefault).length > 0) {
+			combinedFilter = { ...this.filterDefault };
+		}
+
+		if (filter) {
+			let parsedFilter: any = filter;
+			if (typeof filter === 'string') {
+				try {
+					parsedFilter = JSON.parse(filter);
+				} catch (_) {
+					parsedFilter = null;
+				}
+			}
+			if (parsedFilter && typeof parsedFilter === 'object' && Object.keys(parsedFilter).length > 0) {
+				combinedFilter = combinedFilter ? { $and: [combinedFilter, parsedFilter] } : parsedFilter;
+			}
+		}
+
+		if (combinedFilter) {
+			vectorSearchStage.filter = combinedFilter;
+		}
+
+		const pipeline: any[] = [
+			{
+				$vectorSearch: vectorSearchStage,
+			},
+			{
+				$addFields: {
+					_score: { $meta: 'vectorSearchScore' },
+				},
+			},
+		];
+
+		if (this.similarityThreshold > 0) {
+			pipeline.push({
+				$match: {
+					_score: { $gte: this.similarityThreshold },
+				},
+			});
+		}
+
+		if (this.projectionOptions) {
+			const projectStage: any = {};
+			if (this.projectionOptions.excludeEmbedding && this.embeddingField) {
+				projectStage[this.embeddingField] = 0;
+			}
+			if (this.projectionOptions.excludeId) {
+				projectStage._id = 0;
+			}
+			if (Object.keys(projectStage).length > 0) {
+				pipeline.push({ $project: projectStage });
+			}
+		}
+
+		const docs = await collection.aggregate(pipeline).toArray();
+		const results: [DocumentInterface, number][] = [];
+
+		for (const doc of docs) {
+			const cleanedDoc = cleanBsonTypes(doc);
+			const score = cleanedDoc._score ?? 0;
+			delete cleanedDoc._score;
+
+			let pageContent = '';
+			if (this.textField && cleanedDoc[this.textField] !== undefined) {
+				pageContent = typeof cleanedDoc[this.textField] === 'string'
+					? cleanedDoc[this.textField]
+					: JSON.stringify(cleanedDoc[this.textField]);
+			} else {
+				const { _id, ...rest } = cleanedDoc;
+				pageContent = JSON.stringify(rest);
+			}
+
+			results.push([
+				new Document({
+					pageContent,
+					metadata: cleanedDoc,
+				}),
+				score,
+			]);
+		}
+
+		return results;
+	}
+
+	async addVectors(
+		vectors: number[][],
+		documents: DocumentInterface[]
+	): Promise<string[] | void> {
+		const collection = this.db.collection(this.collectionName);
+		const docsToInsert = documents.map((doc, idx) => {
+			const obj: any = {
+				...doc.metadata,
+				[this.embeddingField]: vectors[idx],
+			};
+			if (this.textField) {
+				obj[this.textField] = doc.pageContent;
+			} else {
+				obj.text = doc.pageContent;
+			}
+			return obj;
+		});
+
+		const result = await collection.insertMany(docsToInsert);
+		return Object.values(result.insertedIds).map(id => String(id));
+	}
+
+	async addDocuments(
+		documents: DocumentInterface[]
+	): Promise<string[] | void> {
+		const texts = documents.map(doc => doc.pageContent);
+		const vectors = await this.embeddings.embedDocuments(texts);
+		return this.addVectors(vectors, documents);
+	}
+}
+
 export class MongoDbVectorSearch implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'MongoDB Vector Search',
@@ -159,8 +345,25 @@ export class MongoDbVectorSearch implements INodeType {
 		defaults: {
 			name: 'MongoDB Vector Search',
 		},
-		inputs: ['main', 'ai_embedding'],
-		outputs: ['main'],
+		inputs: [
+			'main',
+			{
+				type: 'ai_embedding',
+				displayName: 'Embedding Model',
+				required: false,
+			},
+		],
+		outputs: [
+			'main',
+			{
+				type: 'ai_vectorStore',
+				displayName: 'Vector Store',
+			},
+			{
+				type: 'ai_tool',
+				displayName: 'Tool',
+			},
+		],
 		credentials: [
 			{
 				name: 'mongoDb',
@@ -245,6 +448,18 @@ export class MongoDbVectorSearch implements INodeType {
 				},
 				default: 'embedding',
 				description: 'The document field containing vector embeddings (array of numbers).',
+			},
+			{
+				displayName: 'Text Field Name',
+				name: 'textField',
+				type: 'string',
+				displayOptions: {
+					show: {
+						operation: ['vectorSearch'],
+					},
+				},
+				default: 'text',
+				description: 'The MongoDB document field containing the primary text content for AI Agent context. If empty or not found, the full document JSON will be used.',
 			},
 			{
 				displayName: 'Query Input Type',
@@ -759,6 +974,93 @@ export class MongoDbVectorSearch implements INodeType {
 			},
 		},
 	};
+
+	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
+		const credentials = await this.getCredentials('mongoDb', itemIndex);
+		const client = await getMongoClient(this, credentials);
+
+		let dbName = this.getNodeParameter('database', itemIndex, '') as string;
+		if (!dbName) {
+			dbName = (credentials.database as string) || '';
+			if (!dbName && credentials.configurationType === 'connectionString') {
+				const uri = credentials.connectionString as string;
+				const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+				if (match) {
+					dbName = match[1];
+				}
+			}
+		}
+
+		if (!dbName) {
+			throw new NodeOperationError(
+				this.getNode(),
+				'Database name could not be resolved. Please specify it in the Database Name field.'
+			);
+		}
+
+		const collectionName = this.getNodeParameter('collection', itemIndex) as string;
+		const indexName = this.getNodeParameter('indexName', itemIndex, 'default') as string;
+		const embeddingField = this.getNodeParameter('embeddingField', itemIndex, 'embedding') as string;
+		const textField = this.getNodeParameter('textField', itemIndex, 'text') as string;
+		const numCandidates = this.getNodeParameter('numCandidates', itemIndex, 100) as number;
+		const limit = this.getNodeParameter('limit', itemIndex, 10) as number;
+		const similarityThreshold = this.getNodeParameter('similarityThreshold', itemIndex, 0) as number;
+		const filterRaw = this.getNodeParameter('filter', itemIndex, '') as string;
+		const nodeOptions = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
+		const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
+
+		let filterDefault: any = null;
+		if (filterRaw && filterRaw.trim() !== '') {
+			filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
+		}
+
+		const embedder = (await this.getInputConnectionData('ai_embedding', itemIndex)) as EmbeddingsInterface;
+		if (!embedder) {
+			throw new NodeOperationError(
+				this.getNode(),
+				'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI Embeddings or Ollama Embeddings) to the node\'s Embedding Model input port.'
+			);
+		}
+
+		const db = client.db(dbName);
+
+		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
+		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
+
+		const vectorStore = new MongoDbAtlasVectorStore({
+			embeddings: embedder,
+			db,
+			collectionName,
+			indexName,
+			embeddingField,
+			textField,
+			numCandidates,
+			limit,
+			similarityThreshold,
+			filterDefault,
+			projectionOptions: {
+				excludeEmbedding,
+				excludeId,
+			},
+		});
+
+		const nodeOutputs = this.getNodeOutputs();
+		const connectedType = nodeOutputs?.[0]?.type || 'ai_vectorStore';
+
+		if (connectedType === 'ai_tool') {
+			const tool = new DynamicTool({
+				name: 'mongodb_vector_search',
+				description: `Search the MongoDB Atlas collection "${collectionName}" using vector similarity search. Input should be a search query string.`,
+				func: async (input: string) => {
+					const docs = await vectorStore.similaritySearch(input, limit);
+					return docs.map(d => d.pageContent).join('\n---\n');
+				},
+			});
+			return { response: tool };
+		}
+
+		return { response: vectorStore };
+	}
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();

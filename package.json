@@ -1,6 +1,6 @@
 {
 	"name": "n8n-nodes-mongodb-vector-search",
-	"version": "1.0.11",
+	"version": "1.0.12",
 	"description": "Custom n8n node for high-performance MongoDB Vector Search, standard queries, and custom JSON aggregations.",
 	"license": "MIT",
 	"homepage": "https://github.com/DanEvenSegler/n8n-nodes-mongodb-vector-search",
@@ -35,6 +35,7 @@
 		]
 	},
 	"dependencies": {
+		"@langchain/core": "^0.2.0 || ^0.3.0 || ^1.0.0",
 		"mongodb": "^6.5.0"
 	},
 	"devDependencies": {
