@@ -1,0 +1,784 @@
+import {
+	IDataObject,
+	INodeType,
+	INodeTypeDescription,
+	NodeOperationError,
+	ILoadOptionsFunctions,
+	INodePropertyOptions,
+	ISupplyDataFunctions,
+	SupplyData,
+} from 'n8n-workflow';
+import { MongoClient, MongoClientOptions, ObjectId, BSON } from 'mongodb';
+import { createHash } from 'crypto';
+import { VectorStore } from '@langchain/core/vectorstores';
+import { Document, DocumentInterface } from '@langchain/core/documents';
+import { EmbeddingsInterface } from '@langchain/core/embeddings';
+import { DynamicTool } from '@langchain/core/tools';
+
+// Global cache for MongoClients to ensure connection pooling and high performance
+const clientCache: { [key: string]: MongoClient } = {};
+
+function getCacheKey(credentials: IDataObject): string {
+	const str = JSON.stringify(credentials);
+	return createHash('md5').update(str).digest('hex');
+}
+
+async function getMongoClient(node: any, credentials: IDataObject): Promise<MongoClient> {
+	const key = getCacheKey(credentials);
+
+	if (clientCache[key]) {
+		try {
+			await clientCache[key].db().admin().ping();
+			return clientCache[key];
+		} catch (e) {
+			try {
+				await clientCache[key].close();
+			} catch (_) {}
+			delete clientCache[key];
+		}
+	}
+
+	let connectionString = '';
+	const options: MongoClientOptions = {};
+
+	if (credentials.configurationType === 'connectionString') {
+		if (!credentials.connectionString) {
+			throw new NodeOperationError(node, 'Connection string is required when Configuration Type is Connection String.');
+		}
+		connectionString = (credentials.connectionString as string).trim();
+	} else {
+		const host = credentials.host as string;
+		const port = credentials.port as number;
+		const user = credentials.user as string;
+		const password = credentials.password as string;
+		const database = (credentials.database as string) || '';
+		const connectionParameters = (credentials.connectionParameters as string) || '';
+
+		if (!host) {
+			throw new NodeOperationError(node, 'Host is required when Configuration Type is Values.');
+		}
+
+		let auth = '';
+		if (user && password) {
+			auth = `${encodeURIComponent(user)}:${encodeURIComponent(password)}@`;
+		}
+
+		const isSrv = !port;
+		const protocol = isSrv ? 'mongodb+srv' : 'mongodb';
+		const hostPort = isSrv ? host : `${host}:${port}`;
+
+		connectionString = `${protocol}://${auth}${hostPort}/${database}`;
+
+		if (connectionParameters) {
+			const prefix = connectionString.includes('?') ? '&' : '?';
+			connectionString += `${prefix}${connectionParameters}`;
+		}
+	}
+
+	if (credentials.ssl) {
+		options.tls = true;
+		if (credentials.ca) {
+			options.ca = Buffer.from(credentials.ca as string, 'utf-8');
+		}
+		if (credentials.cert) {
+			options.cert = Buffer.from(credentials.cert as string, 'utf-8');
+		}
+		if (credentials.key) {
+			options.key = Buffer.from(credentials.key as string, 'utf-8');
+		}
+		if (credentials.passphrase) {
+			options.passphrase = credentials.passphrase as string;
+		}
+	}
+
+	try {
+		const client = new MongoClient(connectionString, options);
+		await client.connect();
+		clientCache[key] = client;
+		return client;
+	} catch (error) {
+		throw new NodeOperationError(node, `Failed to connect to MongoDB: ${(error as Error).message}`);
+	}
+}
+
+function parseJson(node: any, jsonStr: string, fieldName: string, jsonFormatting: boolean): any {
+	if (!jsonStr || jsonStr.trim() === '') {
+		return {};
+	}
+	try {
+		if (jsonFormatting) {
+			return BSON.EJSON.parse(jsonStr);
+		} else {
+			return JSON.parse(jsonStr);
+		}
+	} catch (error) {
+		throw new NodeOperationError(
+			node,
+			`Failed to parse JSON for field "${fieldName}": ${(error as Error).message}`
+		);
+	}
+}
+
+function cleanBsonTypes(obj: any): any {
+	if (obj === null || obj === undefined) return obj;
+	if (Array.isArray(obj)) {
+		return obj.map(cleanBsonTypes);
+	}
+	if (obj instanceof ObjectId) {
+		return obj.toString();
+	}
+	if (obj instanceof Date) {
+		return obj.toISOString();
+	}
+	if (typeof obj === 'object') {
+		if (obj.hasOwnProperty('$oid')) {
+			return obj.$oid;
+		}
+		if (obj.hasOwnProperty('$date')) {
+			return typeof obj.$date === 'string' ? obj.$date : new Date(obj.$date).toISOString();
+		}
+		const newObj: any = {};
+		for (const key of Object.keys(obj)) {
+			newObj[key] = cleanBsonTypes(obj[key]);
+		}
+		return newObj;
+	}
+	return obj;
+}
+
+function extractQueryString(input: any): string {
+	if (input === null || input === undefined) return '';
+	if (typeof input === 'string') {
+		const trimmed = input.trim();
+		if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+			try {
+				const parsed = JSON.parse(trimmed);
+				return extractQueryString(parsed);
+			} catch (_) {
+				return trimmed;
+			}
+		}
+		return trimmed;
+	}
+	if (typeof input === 'object') {
+		if (typeof input.query === 'string') return input.query;
+		if (typeof input.input === 'string') return input.input;
+		if (typeof input.prompt === 'string') return input.prompt;
+		if (typeof input.search === 'string') return input.search;
+		if (typeof input.text === 'string') return input.text;
+		const strValues = Object.values(input).filter((v) => typeof v === 'string');
+		if (strValues.length > 0) return strValues[0] as string;
+		return JSON.stringify(input);
+	}
+	return String(input);
+}
+
+export interface MongoDbVectorStoreOptions {
+	embeddings: EmbeddingsInterface;
+	db: any;
+	collectionName: string;
+	indexName: string;
+	embeddingField: string;
+	textField?: string;
+	numCandidates?: number;
+	limit?: number;
+	similarityThreshold?: number;
+	filterDefault?: any;
+	toolName?: string;
+	toolDescription?: string;
+	projectionOptions?: {
+		excludeEmbedding?: boolean;
+		excludeId?: boolean;
+	};
+}
+
+export class MongoDbAtlasVectorStore extends VectorStore {
+	declare FilterType: Record<string, any> | string;
+	public name: string;
+	public description: string;
+	public toolDescription: string;
+	private db: any;
+	private collectionName: string;
+	private indexName: string;
+	private embeddingField: string;
+	private textField: string;
+	private numCandidates: number;
+	private limit: number;
+	private similarityThreshold: number;
+	private filterDefault?: any;
+	private projectionOptions?: any;
+
+	constructor(options: MongoDbVectorStoreOptions) {
+		super(options.embeddings, {});
+		this.db = options.db;
+		this.collectionName = options.collectionName;
+		this.indexName = options.indexName;
+		this.embeddingField = options.embeddingField;
+		this.textField = options.textField || '';
+		this.numCandidates = options.numCandidates || 100;
+		this.limit = options.limit || 10;
+		this.similarityThreshold = options.similarityThreshold || 0;
+		this.filterDefault = options.filterDefault;
+		this.projectionOptions = options.projectionOptions;
+		this.name = options.toolName || 'mongodb_vector_search';
+		this.description = options.toolDescription || '';
+		this.toolDescription = options.toolDescription || '';
+	}
+
+	_vectorstoreType(): string {
+		return 'mongodb';
+	}
+
+	async similaritySearchVectorWithScore(
+		query: number[],
+		k: number,
+		filter?: Record<string, any> | string
+	): Promise<[DocumentInterface, number][]> {
+		const collection = this.db.collection(this.collectionName);
+		const limitToUse = k || this.limit || 10;
+
+		const vectorSearchStage: any = {
+			index: this.indexName,
+			path: this.embeddingField,
+			queryVector: query,
+			numCandidates: Math.max(this.numCandidates || 100, limitToUse * 10),
+			limit: limitToUse,
+		};
+
+		let combinedFilter: any = null;
+		if (this.filterDefault && Object.keys(this.filterDefault).length > 0) {
+			combinedFilter = { ...this.filterDefault };
+		}
+
+		if (filter) {
+			let parsedFilter: any = filter;
+			if (typeof filter === 'string') {
+				try {
+					parsedFilter = JSON.parse(filter);
+				} catch (_) {
+					parsedFilter = null;
+				}
+			}
+			if (parsedFilter && typeof parsedFilter === 'object' && Object.keys(parsedFilter).length > 0) {
+				combinedFilter = combinedFilter ? { $and: [combinedFilter, parsedFilter] } : parsedFilter;
+			}
+		}
+
+		if (combinedFilter) {
+			vectorSearchStage.filter = combinedFilter;
+		}
+
+		const pipeline: any[] = [
+			{
+				$vectorSearch: vectorSearchStage,
+			},
+			{
+				$addFields: {
+					_score: { $meta: 'vectorSearchScore' },
+				},
+			},
+		];
+
+		if (this.similarityThreshold > 0) {
+			pipeline.push({
+				$match: {
+					_score: { $gte: this.similarityThreshold },
+				},
+			});
+		}
+
+		if (this.projectionOptions) {
+			const projectStage: any = {};
+			if (this.projectionOptions.excludeEmbedding && this.embeddingField) {
+				projectStage[this.embeddingField] = 0;
+			}
+			if (this.projectionOptions.excludeId) {
+				projectStage._id = 0;
+			}
+			if (Object.keys(projectStage).length > 0) {
+				pipeline.push({ $project: projectStage });
+			}
+		}
+
+		let docs: any[] = [];
+		try {
+			docs = await collection.aggregate(pipeline).toArray();
+		} catch (error) {
+			throw new NodeOperationError(
+				{ name: 'MongoDB Vector Search' } as any,
+				`MongoDB Vector Search pipeline failed on collection "${this.collectionName}": ${(error as Error).message}`
+			);
+		}
+		const results: [DocumentInterface, number][] = [];
+
+		for (const doc of docs) {
+			const cleanedDoc = cleanBsonTypes(doc);
+			const score = cleanedDoc._score ?? 0;
+			delete cleanedDoc._score;
+
+			let pageContent = '';
+			if (this.textField && cleanedDoc[this.textField] !== undefined) {
+				pageContent = typeof cleanedDoc[this.textField] === 'string'
+					? cleanedDoc[this.textField]
+					: JSON.stringify(cleanedDoc[this.textField]);
+			} else {
+				const { _id, ...rest } = cleanedDoc;
+				pageContent = JSON.stringify(rest);
+			}
+
+			results.push([
+				new Document({
+					pageContent,
+					metadata: cleanedDoc,
+				}),
+				score,
+			]);
+		}
+
+		return results;
+	}
+
+	async similaritySearch(
+		query: string | any,
+		k?: number,
+		filter?: this['FilterType']
+	): Promise<DocumentInterface[]> {
+		const cleanQuery = extractQueryString(query);
+		if (!cleanQuery) return [];
+		const vector = await this.embeddings.embedQuery(cleanQuery);
+		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter);
+		return results.map(([doc]) => doc);
+	}
+
+	async addVectors(
+		vectors: number[][],
+		documents: DocumentInterface[]
+	): Promise<string[] | void> {
+		const collection = this.db.collection(this.collectionName);
+		const docsToInsert = documents.map((doc, idx) => {
+			const obj: any = {
+				...doc.metadata,
+				[this.embeddingField]: vectors[idx],
+			};
+			if (this.textField) {
+				obj[this.textField] = doc.pageContent;
+			} else {
+				obj.text = doc.pageContent;
+			}
+			return obj;
+		});
+
+		const result = await collection.insertMany(docsToInsert);
+		return Object.values(result.insertedIds).map((id) => String(id));
+	}
+
+	async addDocuments(
+		documents: DocumentInterface[]
+	): Promise<string[] | void> {
+		const texts = documents.map((doc) => doc.pageContent);
+		const vectors = await this.embeddings.embedDocuments(texts);
+		return this.addVectors(vectors, documents);
+	}
+}
+
+export class MongoDbVectorSearchVectorStore implements INodeType {
+	description: INodeTypeDescription = {
+		displayName: 'MongoDB Vector Search (AI Store/Tool)',
+		name: 'mongoDbVectorSearchVectorStore',
+		icon: {
+			light: 'file:mongodb-vector-search-light.svg',
+			dark: 'file:mongodb-vector-search-dark.svg',
+		},
+		group: ['transform'],
+		version: 1,
+		description: 'Connect MongoDB Vector Search as a Vector Store or Tool sub-node for n8n AI Agents.',
+		defaults: {
+			name: 'MongoDB Vector Search (AI)',
+		},
+		inputs: [
+			{
+				type: 'ai_embedding',
+				displayName: 'Embedding Model',
+				required: true,
+			},
+		],
+		outputs: [
+			{
+				type: 'ai_vectorStore',
+				displayName: 'Vector Store',
+			},
+			{
+				type: 'ai_tool',
+				displayName: 'Tool',
+			},
+		],
+		credentials: [
+			{
+				name: 'mongoDb',
+				required: true,
+			},
+		],
+		properties: [
+			{
+				displayName: 'Database Name',
+				name: 'database',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getDatabases',
+				},
+				default: '',
+				description: 'Select the database from the dropdown. If you want to use expressions, toggle the expression button.',
+			},
+			{
+				displayName: 'Collection Name',
+				name: 'collection',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getCollections',
+					loadOptionsDependsOn: ['database'],
+				},
+				required: true,
+				default: '',
+				description: 'Select the collection from the dropdown. If you want to use expressions, toggle the expression button.',
+			},
+			{
+				displayName: 'Index Name',
+				name: 'indexName',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getSearchIndexes',
+					loadOptionsDependsOn: ['database', 'collection'],
+				},
+				required: true,
+				default: 'default',
+				description: 'Select the Vector Search index from the dropdown. If you want to use expressions, toggle the expression button.',
+			},
+			{
+				displayName: 'Embedding Field',
+				name: 'embeddingField',
+				type: 'string',
+				required: true,
+				default: 'embedding',
+				description: 'The document field containing vector embeddings (array of numbers).',
+			},
+			{
+				displayName: 'Text Field Name',
+				name: 'textField',
+				type: 'string',
+				default: 'text',
+				description: 'The MongoDB document field containing the primary text content for AI Agent context. If empty or not found, the full document JSON will be used.',
+			},
+			{
+				displayName: 'Num Candidates',
+				name: 'numCandidates',
+				type: 'number',
+				default: 100,
+				description: 'The number of nearest neighbors to search before selecting the final limit. A higher number increases recall but may impact performance.',
+			},
+			{
+				displayName: 'Limit',
+				name: 'limit',
+				type: 'number',
+				default: 10,
+				description: 'Number of results to return.',
+			},
+			{
+				displayName: 'Similarity Threshold',
+				name: 'similarityThreshold',
+				type: 'number',
+				typeOptions: {
+					numberPrecision: 4,
+				},
+				default: 0,
+				description: 'Only return results with a similarity score greater than or equal to this threshold. Set to 0 to disable.',
+			},
+			{
+				displayName: 'Filter',
+				name: 'filter',
+				type: 'string',
+				default: '',
+				placeholder: '{"status": "active"}',
+				description: 'Optional MongoDB filter document to restrict the search. E.g., {"status": "active"}. Evaluated within the $vectorSearch stage.',
+			},
+			{
+				displayName: 'Exclude ID Field (_id)',
+				name: 'excludeId',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to exclude the default MongoDB _id field from the output.',
+			},
+			{
+				displayName: 'Exclude Embedding Field',
+				name: 'excludeEmbedding',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to exclude the large embedding vector array from the output to save memory.',
+			},
+
+			// Options
+			{
+				displayName: 'Options',
+				name: 'options',
+				type: 'collection',
+				placeholder: 'Add Option',
+				default: {},
+				options: [
+					{
+						displayName: 'Tool Name',
+						name: 'toolName',
+						type: 'string',
+						default: '',
+						placeholder: 'search_my_collection',
+						description: 'Custom name of the tool as exposed to the AI Agent. If left empty, it will be automatically generated from the collection name (e.g. search_products). Must be lowercase alphanumeric with underscores.',
+					},
+					{
+						displayName: 'Tool Description',
+						name: 'toolDescription',
+						type: 'string',
+						typeOptions: {
+							rows: 4,
+						},
+						default: '',
+						placeholder: 'Use this tool to search the MongoDB vector database for relevant documents based on semantic similarity...',
+						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, a description will be automatically generated from your database, collection, and field settings.',
+					},
+				],
+			},
+		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getDatabases(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const adminDb = client.db().admin();
+					const dbInfo = await adminDb.listDatabases();
+					for (const db of dbInfo.databases) {
+						results.push({
+							name: db.name,
+							value: db.name,
+						});
+					}
+				} catch (e) {
+					let defaultDb = (credentials.database as string) || '';
+					if (!defaultDb && credentials.configurationType === 'connectionString') {
+						const uri = credentials.connectionString as string;
+						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+						if (match) {
+							defaultDb = match[1];
+						}
+					}
+					if (defaultDb) {
+						results.push({
+							name: defaultDb,
+							value: defaultDb,
+						});
+					} else {
+						results.push({
+							name: 'admin',
+							value: 'admin',
+						});
+					}
+				}
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
+
+			async getCollections(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				let dbName = this.getCurrentNodeParameter('database') as string;
+				if (!dbName) {
+					dbName = (credentials.database as string) || '';
+					if (!dbName && credentials.configurationType === 'connectionString') {
+						const uri = credentials.connectionString as string;
+						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+						if (match) {
+							dbName = match[1];
+						}
+					}
+				}
+
+				if (!dbName) {
+					return [];
+				}
+
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const db = client.db(dbName);
+					const collections = await db.listCollections().toArray();
+					for (const col of collections) {
+						results.push({
+							name: col.name,
+							value: col.name,
+						});
+					}
+				} catch (e) {
+					// Return empty list if fetch fails
+				}
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
+
+			async getSearchIndexes(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('mongoDb');
+				const dbName = this.getCurrentNodeParameter('database') as string;
+				const collectionName = this.getCurrentNodeParameter('collection') as string;
+
+				if (!dbName || !collectionName) {
+					return [];
+				}
+
+				const results: INodePropertyOptions[] = [];
+				try {
+					const client = await getMongoClient(this, credentials);
+					const db = client.db(dbName);
+					const collection = db.collection(collectionName);
+					const cursor = collection.listSearchIndexes();
+					for await (const idx of cursor) {
+						results.push({
+							name: idx.name,
+							value: idx.name,
+						});
+					}
+				} catch (e) {
+					// Fallback for non-Atlas or permission restrictions
+				}
+
+				if (results.length === 0) {
+					results.push({
+						name: 'default',
+						value: 'default',
+					});
+				}
+
+				results.sort((a, b) => a.name.localeCompare(b.name));
+				return results;
+			},
+		},
+	};
+
+	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
+		const credentials = await this.getCredentials('mongoDb', itemIndex);
+		const client = await getMongoClient(this, credentials);
+
+		let dbName = this.getNodeParameter('database', itemIndex, '') as string;
+		if (!dbName) {
+			dbName = (credentials.database as string) || '';
+			if (!dbName && credentials.configurationType === 'connectionString') {
+				const uri = credentials.connectionString as string;
+				const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+				if (match) {
+					dbName = match[1];
+				}
+			}
+		}
+
+		if (!dbName) {
+			throw new NodeOperationError(
+				this.getNode(),
+				'Database name could not be resolved. Please specify it in the Database Name field.'
+			);
+		}
+
+		const collectionName = this.getNodeParameter('collection', itemIndex) as string;
+		const indexName = this.getNodeParameter('indexName', itemIndex, 'default') as string;
+		const embeddingField = this.getNodeParameter('embeddingField', itemIndex, 'embedding') as string;
+		const textField = this.getNodeParameter('textField', itemIndex, 'text') as string;
+		const numCandidates = this.getNodeParameter('numCandidates', itemIndex, 100) as number;
+		const limit = this.getNodeParameter('limit', itemIndex, 10) as number;
+		const similarityThreshold = this.getNodeParameter('similarityThreshold', itemIndex, 0) as number;
+		const filterRaw = this.getNodeParameter('filter', itemIndex, '') as string;
+		const nodeOptions = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
+		const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
+
+		let filterDefault: any = null;
+		if (filterRaw && filterRaw.trim() !== '') {
+			filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
+		}
+
+		const embedder = (await this.getInputConnectionData('ai_embedding', itemIndex)) as EmbeddingsInterface;
+		if (!embedder) {
+			throw new NodeOperationError(
+				this.getNode(),
+				'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI Embeddings or Ollama Embeddings) to the node\'s Embedding Model input port.'
+			);
+		}
+
+		const db = client.db(dbName);
+
+		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
+		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
+
+		// Auto-generate tool name based on collection name if not specified by user
+		const sanitizedCol = (collectionName || 'vector_db')
+			.toLowerCase()
+			.replace(/[^a-z0-9_]/g, '_')
+			.replace(/_+/g, '_')
+			.replace(/^_|_$/g, '');
+		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'mongodb_vector_search';
+
+		const toolNameRaw = (nodeOptions.toolName as string) || '';
+		const toolName = toolNameRaw.trim() !== ''
+			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
+			: autoToolName;
+
+		// Auto-generate tool description based on dropdowns and field settings if not specified by user
+		const textInfo = textField ? ` (primary text field: "${textField}")` : '';
+		const filterInfo = filterRaw && filterRaw.trim() !== '' ? ` with pre-configured query filters` : '';
+		const autoDescription = `Use this tool to search the MongoDB collection "${collectionName}" (database: "${dbName}", index: "${indexName}")${textInfo} using vector similarity search${filterInfo}. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string describing what information you need to retrieve.`;
+
+		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
+		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
+
+		const vectorStore = new MongoDbAtlasVectorStore({
+			embeddings: embedder,
+			db,
+			collectionName,
+			indexName,
+			embeddingField,
+			textField,
+			numCandidates,
+			limit,
+			similarityThreshold,
+			filterDefault,
+			toolName,
+			toolDescription,
+			projectionOptions: {
+				excludeEmbedding,
+				excludeId,
+			},
+		});
+
+		const nodeOutputs = this.getNodeOutputs();
+		const connectedType = nodeOutputs?.[0]?.type || 'ai_vectorStore';
+
+		if (connectedType === 'ai_tool') {
+			const tool = new DynamicTool({
+				name: toolName,
+				description: toolDescription,
+				func: async (input: any) => {
+					try {
+						const queryStr = extractQueryString(input);
+						if (!queryStr) {
+							return 'Please provide a non-empty search query string.';
+						}
+						const docs = await vectorStore.similaritySearch(queryStr, limit);
+						if (!docs || docs.length === 0) {
+							return `No matching documents found in MongoDB collection "${collectionName}" for search query "${queryStr}".`;
+						}
+						return docs.map((d) => d.pageContent).join('\n---\n');
+					} catch (err) {
+						return `Error executing MongoDB Vector Search tool: ${(err as Error).message}`;
+					}
+				},
+			});
+			return { response: tool };
+		}
+
+		return { response: vectorStore };
+	}
+}

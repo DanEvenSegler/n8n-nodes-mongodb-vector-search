@@ -7,15 +7,9 @@ import {
 	NodeOperationError,
 	ILoadOptionsFunctions,
 	INodePropertyOptions,
-	ISupplyDataFunctions,
-	SupplyData,
 } from 'n8n-workflow';
 import { MongoClient, MongoClientOptions, ObjectId, BSON } from 'mongodb';
 import { createHash } from 'crypto';
-import { VectorStore } from '@langchain/core/vectorstores';
-import { Document, DocumentInterface } from '@langchain/core/documents';
-import { EmbeddingsInterface } from '@langchain/core/embeddings';
-import { DynamicTool } from '@langchain/core/tools';
 
 // Global cache for MongoClients to ensure connection pooling and high performance
 const clientCache: { [key: string]: MongoClient } = {};
@@ -54,8 +48,8 @@ async function getMongoClient(node: any, credentials: IDataObject): Promise<Mong
 		const port = credentials.port as number;
 		const user = credentials.user as string;
 		const password = credentials.password as string;
-		const database = credentials.database as string || '';
-		const connectionParameters = credentials.connectionParameters as string || '';
+		const database = (credentials.database as string) || '';
+		const connectionParameters = (credentials.connectionParameters as string) || '';
 
 		if (!host) {
 			throw new NodeOperationError(node, 'Host is required when Configuration Type is Values.');
@@ -151,241 +145,6 @@ function cleanBsonTypes(obj: any): any {
 	return obj;
 }
 
-function extractQueryString(input: any): string {
-	if (input === null || input === undefined) return '';
-	if (typeof input === 'string') {
-		const trimmed = input.trim();
-		if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-			try {
-				const parsed = JSON.parse(trimmed);
-				return extractQueryString(parsed);
-			} catch (_) {
-				return trimmed;
-			}
-		}
-		return trimmed;
-	}
-	if (typeof input === 'object') {
-		if (typeof input.query === 'string') return input.query;
-		if (typeof input.input === 'string') return input.input;
-		if (typeof input.prompt === 'string') return input.prompt;
-		if (typeof input.search === 'string') return input.search;
-		if (typeof input.text === 'string') return input.text;
-		const strValues = Object.values(input).filter(v => typeof v === 'string');
-		if (strValues.length > 0) return strValues[0] as string;
-		return JSON.stringify(input);
-	}
-	return String(input);
-}
-
-export interface MongoDbVectorStoreOptions {
-	embeddings: EmbeddingsInterface;
-	db: any;
-	collectionName: string;
-	indexName: string;
-	embeddingField: string;
-	textField?: string;
-	numCandidates?: number;
-	limit?: number;
-	similarityThreshold?: number;
-	filterDefault?: any;
-	toolName?: string;
-	toolDescription?: string;
-	projectionOptions?: {
-		excludeEmbedding?: boolean;
-		excludeId?: boolean;
-	};
-}
-
-export class MongoDbAtlasVectorStore extends VectorStore {
-	declare FilterType: Record<string, any> | string;
-	public name: string;
-	public description: string;
-	public toolDescription: string;
-	private db: any;
-	private collectionName: string;
-	private indexName: string;
-	private embeddingField: string;
-	private textField: string;
-	private numCandidates: number;
-	private limit: number;
-	private similarityThreshold: number;
-	private filterDefault?: any;
-	private projectionOptions?: any;
-
-	constructor(options: MongoDbVectorStoreOptions) {
-		super(options.embeddings, {});
-		this.db = options.db;
-		this.collectionName = options.collectionName;
-		this.indexName = options.indexName;
-		this.embeddingField = options.embeddingField;
-		this.textField = options.textField || '';
-		this.numCandidates = options.numCandidates || 100;
-		this.limit = options.limit || 10;
-		this.similarityThreshold = options.similarityThreshold || 0;
-		this.filterDefault = options.filterDefault;
-		this.projectionOptions = options.projectionOptions;
-		this.name = options.toolName || 'mongodb_vector_search';
-		this.description = options.toolDescription || '';
-		this.toolDescription = options.toolDescription || '';
-	}
-
-	_vectorstoreType(): string {
-		return 'mongodb';
-	}
-
-	async similaritySearchVectorWithScore(
-		query: number[],
-		k: number,
-		filter?: Record<string, any> | string
-	): Promise<[DocumentInterface, number][]> {
-		const collection = this.db.collection(this.collectionName);
-		const limitToUse = k || this.limit || 10;
-
-		const vectorSearchStage: any = {
-			index: this.indexName,
-			path: this.embeddingField,
-			queryVector: query,
-			numCandidates: Math.max(this.numCandidates || 100, limitToUse * 10),
-			limit: limitToUse,
-		};
-
-		let combinedFilter: any = null;
-		if (this.filterDefault && Object.keys(this.filterDefault).length > 0) {
-			combinedFilter = { ...this.filterDefault };
-		}
-
-		if (filter) {
-			let parsedFilter: any = filter;
-			if (typeof filter === 'string') {
-				try {
-					parsedFilter = JSON.parse(filter);
-				} catch (_) {
-					parsedFilter = null;
-				}
-			}
-			if (parsedFilter && typeof parsedFilter === 'object' && Object.keys(parsedFilter).length > 0) {
-				combinedFilter = combinedFilter ? { $and: [combinedFilter, parsedFilter] } : parsedFilter;
-			}
-		}
-
-		if (combinedFilter) {
-			vectorSearchStage.filter = combinedFilter;
-		}
-
-		const pipeline: any[] = [
-			{
-				$vectorSearch: vectorSearchStage,
-			},
-			{
-				$addFields: {
-					_score: { $meta: 'vectorSearchScore' },
-				},
-			},
-		];
-
-		if (this.similarityThreshold > 0) {
-			pipeline.push({
-				$match: {
-					_score: { $gte: this.similarityThreshold },
-				},
-			});
-		}
-
-		if (this.projectionOptions) {
-			const projectStage: any = {};
-			if (this.projectionOptions.excludeEmbedding && this.embeddingField) {
-				projectStage[this.embeddingField] = 0;
-			}
-			if (this.projectionOptions.excludeId) {
-				projectStage._id = 0;
-			}
-			if (Object.keys(projectStage).length > 0) {
-				pipeline.push({ $project: projectStage });
-			}
-		}
-
-		let docs: any[] = [];
-		try {
-			docs = await collection.aggregate(pipeline).toArray();
-		} catch (error) {
-			throw new NodeOperationError(
-				{ name: 'MongoDB Vector Search' } as any,
-				`MongoDB Vector Search pipeline failed on collection "${this.collectionName}": ${(error as Error).message}`
-			);
-		}
-		const results: [DocumentInterface, number][] = [];
-
-		for (const doc of docs) {
-			const cleanedDoc = cleanBsonTypes(doc);
-			const score = cleanedDoc._score ?? 0;
-			delete cleanedDoc._score;
-
-			let pageContent = '';
-			if (this.textField && cleanedDoc[this.textField] !== undefined) {
-				pageContent = typeof cleanedDoc[this.textField] === 'string'
-					? cleanedDoc[this.textField]
-					: JSON.stringify(cleanedDoc[this.textField]);
-			} else {
-				const { _id, ...rest } = cleanedDoc;
-				pageContent = JSON.stringify(rest);
-			}
-
-			results.push([
-				new Document({
-					pageContent,
-					metadata: cleanedDoc,
-				}),
-				score,
-			]);
-		}
-
-		return results;
-	}
-
-	async similaritySearch(
-		query: string | any,
-		k?: number,
-		filter?: this['FilterType']
-	): Promise<DocumentInterface[]> {
-		const cleanQuery = extractQueryString(query);
-		if (!cleanQuery) return [];
-		const vector = await this.embeddings.embedQuery(cleanQuery);
-		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter);
-		return results.map(([doc]) => doc);
-	}
-
-	async addVectors(
-		vectors: number[][],
-		documents: DocumentInterface[]
-	): Promise<string[] | void> {
-		const collection = this.db.collection(this.collectionName);
-		const docsToInsert = documents.map((doc, idx) => {
-			const obj: any = {
-				...doc.metadata,
-				[this.embeddingField]: vectors[idx],
-			};
-			if (this.textField) {
-				obj[this.textField] = doc.pageContent;
-			} else {
-				obj.text = doc.pageContent;
-			}
-			return obj;
-		});
-
-		const result = await collection.insertMany(docsToInsert);
-		return Object.values(result.insertedIds).map(id => String(id));
-	}
-
-	async addDocuments(
-		documents: DocumentInterface[]
-	): Promise<string[] | void> {
-		const texts = documents.map(doc => doc.pageContent);
-		const vectors = await this.embeddings.embedDocuments(texts);
-		return this.addVectors(vectors, documents);
-	}
-}
-
 export class MongoDbVectorSearch implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'MongoDB Vector Search',
@@ -400,25 +159,8 @@ export class MongoDbVectorSearch implements INodeType {
 		defaults: {
 			name: 'MongoDB Vector Search',
 		},
-		inputs: [
-			'main',
-			{
-				type: 'ai_embedding',
-				displayName: 'Embedding Model',
-				required: false,
-			},
-		],
-		outputs: [
-			'main',
-			{
-				type: 'ai_vectorStore',
-				displayName: 'Vector Store',
-			},
-			{
-				type: 'ai_tool',
-				displayName: 'Tool',
-			},
-		],
+		inputs: ['main', 'ai_embedding'],
+		outputs: ['main'],
 		credentials: [
 			{
 				name: 'mongoDb',
@@ -503,18 +245,6 @@ export class MongoDbVectorSearch implements INodeType {
 				},
 				default: 'embedding',
 				description: 'The document field containing vector embeddings (array of numbers).',
-			},
-			{
-				displayName: 'Text Field Name',
-				name: 'textField',
-				type: 'string',
-				displayOptions: {
-					show: {
-						operation: ['vectorSearch'],
-					},
-				},
-				default: 'text',
-				description: 'The MongoDB document field containing the primary text content for AI Agent context. If empty or not found, the full document JSON will be used.',
 			},
 			{
 				displayName: 'Query Input Type',
@@ -910,25 +640,6 @@ export class MongoDbVectorSearch implements INodeType {
 						default: false,
 						description: 'Whether to return the query execution plan (explanation) instead of the actual documents.',
 					},
-					{
-						displayName: 'Tool Name',
-						name: 'toolName',
-						type: 'string',
-						default: '',
-						placeholder: 'search_my_collection',
-						description: 'Custom name of the tool as exposed to the AI Agent. If left empty, it will be automatically generated from the collection name (e.g. search_products). Must be lowercase alphanumeric with underscores.',
-					},
-					{
-						displayName: 'Tool Description',
-						name: 'toolDescription',
-						type: 'string',
-						typeOptions: {
-							rows: 4,
-						},
-						default: '',
-						placeholder: 'Use this tool to search the MongoDB vector database for relevant documents based on semantic similarity...',
-						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, a description will be automatically generated from your database, collection, and field settings.',
-					},
 				],
 			},
 		],
@@ -950,8 +661,8 @@ export class MongoDbVectorSearch implements INodeType {
 						});
 					}
 				} catch (e) {
-					// Fallback: use database defined in credentials if listDatabases fails (e.g. restricted permissions)
-					let defaultDb = credentials.database as string || '';
+					// Fallback: use database defined in credentials if listDatabases fails
+					let defaultDb = (credentials.database as string) || '';
 					if (!defaultDb && credentials.configurationType === 'connectionString') {
 						const uri = credentials.connectionString as string;
 						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
@@ -979,7 +690,7 @@ export class MongoDbVectorSearch implements INodeType {
 				const credentials = await this.getCredentials('mongoDb');
 				let dbName = this.getCurrentNodeParameter('database') as string;
 				if (!dbName) {
-					dbName = credentials.database as string || '';
+					dbName = (credentials.database as string) || '';
 					if (!dbName && credentials.configurationType === 'connectionString') {
 						const uri = credentials.connectionString as string;
 						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
@@ -1049,127 +760,6 @@ export class MongoDbVectorSearch implements INodeType {
 		},
 	};
 
-	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
-		const credentials = await this.getCredentials('mongoDb', itemIndex);
-		const client = await getMongoClient(this, credentials);
-
-		let dbName = this.getNodeParameter('database', itemIndex, '') as string;
-		if (!dbName) {
-			dbName = (credentials.database as string) || '';
-			if (!dbName && credentials.configurationType === 'connectionString') {
-				const uri = credentials.connectionString as string;
-				const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
-				if (match) {
-					dbName = match[1];
-				}
-			}
-		}
-
-		if (!dbName) {
-			throw new NodeOperationError(
-				this.getNode(),
-				'Database name could not be resolved. Please specify it in the Database Name field.'
-			);
-		}
-
-		const collectionName = this.getNodeParameter('collection', itemIndex) as string;
-		const indexName = this.getNodeParameter('indexName', itemIndex, 'default') as string;
-		const embeddingField = this.getNodeParameter('embeddingField', itemIndex, 'embedding') as string;
-		const textField = this.getNodeParameter('textField', itemIndex, 'text') as string;
-		const numCandidates = this.getNodeParameter('numCandidates', itemIndex, 100) as number;
-		const limit = this.getNodeParameter('limit', itemIndex, 10) as number;
-		const similarityThreshold = this.getNodeParameter('similarityThreshold', itemIndex, 0) as number;
-		const filterRaw = this.getNodeParameter('filter', itemIndex, '') as string;
-		const nodeOptions = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
-		const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
-
-		let filterDefault: any = null;
-		if (filterRaw && filterRaw.trim() !== '') {
-			filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
-		}
-
-		const embedder = (await this.getInputConnectionData('ai_embedding', itemIndex)) as EmbeddingsInterface;
-		if (!embedder) {
-			throw new NodeOperationError(
-				this.getNode(),
-				'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI Embeddings or Ollama Embeddings) to the node\'s Embedding Model input port.'
-			);
-		}
-
-		const db = client.db(dbName);
-
-		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
-		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
-
-		// Auto-generate tool name based on collection name if not specified by user
-		const sanitizedCol = (collectionName || 'vector_db')
-			.toLowerCase()
-			.replace(/[^a-z0-9_]/g, '_')
-			.replace(/_+/g, '_')
-			.replace(/^_|_$/g, '');
-		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'mongodb_vector_search';
-
-		const toolNameRaw = (nodeOptions.toolName as string) || '';
-		const toolName = toolNameRaw.trim() !== ''
-			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
-			: autoToolName;
-
-		// Auto-generate tool description based on dropdowns and field settings if not specified by user
-		const textInfo = textField ? ` (primary text field: "${textField}")` : '';
-		const filterInfo = filterRaw && filterRaw.trim() !== '' ? ` with pre-configured query filters` : '';
-		const autoDescription = `Use this tool to search the MongoDB collection "${collectionName}" (database: "${dbName}", index: "${indexName}")${textInfo} using vector similarity search${filterInfo}. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string describing what information you need to retrieve.`;
-
-		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
-		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
-
-		const vectorStore = new MongoDbAtlasVectorStore({
-			embeddings: embedder,
-			db,
-			collectionName,
-			indexName,
-			embeddingField,
-			textField,
-			numCandidates,
-			limit,
-			similarityThreshold,
-			filterDefault,
-			toolName,
-			toolDescription,
-			projectionOptions: {
-				excludeEmbedding,
-				excludeId,
-			},
-		});
-
-		const nodeOutputs = this.getNodeOutputs();
-		const connectedType = nodeOutputs?.[0]?.type || 'ai_vectorStore';
-
-		if (connectedType === 'ai_tool') {
-			const tool = new DynamicTool({
-				name: toolName,
-				description: toolDescription,
-				func: async (input: any) => {
-					try {
-						const queryStr = extractQueryString(input);
-						if (!queryStr) {
-							return 'Please provide a non-empty search query string.';
-						}
-						const docs = await vectorStore.similaritySearch(queryStr, limit);
-						if (!docs || docs.length === 0) {
-							return `No matching documents found in MongoDB collection "${collectionName}" for search query "${queryStr}".`;
-						}
-						return docs.map(d => d.pageContent).join('\n---\n');
-					} catch (err) {
-						return `Error executing MongoDB Vector Search tool: ${(err as Error).message}`;
-					}
-				},
-			});
-			return { response: tool };
-		}
-
-		return { response: vectorStore };
-	}
-
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
@@ -1182,7 +772,7 @@ export class MongoDbVectorSearch implements INodeType {
 				// Resolve database name
 				let dbName = this.getNodeParameter('database', i, '') as string;
 				if (!dbName) {
-					dbName = credentials.database as string || '';
+					dbName = (credentials.database as string) || '';
 					if (!dbName && credentials.configurationType === 'connectionString') {
 						const uri = credentials.connectionString as string;
 						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
@@ -1211,7 +801,7 @@ export class MongoDbVectorSearch implements INodeType {
 				const scoreFieldName = (nodeOptions.scoreFieldName as string) || '_score';
 				const projectionMode = this.getNodeParameter('projectionMode', i, 'all') as string;
 				const excludeId = this.getNodeParameter('excludeId', i, false) as boolean;
-				const maxTimeMS = nodeOptions.hasOwnProperty('maxTimeMS') ? nodeOptions.maxTimeMS as number : 30000;
+				const maxTimeMS = nodeOptions.hasOwnProperty('maxTimeMS') ? (nodeOptions.maxTimeMS as number) : 30000;
 				const explain = !!nodeOptions.explain;
 
 				// Construct field projection mapping
@@ -1223,12 +813,11 @@ export class MongoDbVectorSearch implements INodeType {
 					const fieldsToInclude = this.getNodeParameter('fieldsToInclude', i, '') as string;
 					const fields = fieldsToInclude
 						.split(',')
-						.map(f => f.trim())
-						.filter(f => f !== '');
+						.map((f) => f.trim())
+						.filter((f) => f !== '');
 					for (const f of fields) {
 						optionsProject[f] = 1;
 					}
-					// If no fields are specified in inclusion mode, ensure we project _id so it doesn't return all fields
 					if (Object.keys(optionsProject).length === 0) {
 						optionsProject._id = excludeId ? 0 : 1;
 					}
@@ -1237,8 +826,8 @@ export class MongoDbVectorSearch implements INodeType {
 					const fieldsToExclude = this.getNodeParameter('fieldsToExclude', i, '') as string;
 					const fields = fieldsToExclude
 						.split(',')
-						.map(f => f.trim())
-						.filter(f => f !== '');
+						.map((f) => f.trim())
+						.filter((f) => f !== '');
 					for (const f of fields) {
 						optionsProject[f] = 0;
 					}
@@ -1266,8 +855,6 @@ export class MongoDbVectorSearch implements INodeType {
 							delete optionsProject[embeddingField];
 						}
 					} else {
-						// If Exclude Embedding Field is OFF, and we are in 'include' mode,
-						// we should explicitly include the embedding field so it's not discarded by the inclusion projection!
 						if (projectionMode === 'include') {
 							optionsProject[embeddingField] = 1;
 						}
@@ -1288,20 +875,7 @@ export class MongoDbVectorSearch implements INodeType {
 					const queryType = this.getNodeParameter('queryType', i, 'vector') as string;
 
 					if (queryType === 'prompt') {
-						const rawPromptText = this.getNodeParameter('prompt', i, '');
-						const promptText = extractQueryString(rawPromptText);
-						if (!promptText || promptText.trim() === '') {
-							results = [];
-							if (outputMode === 'separate') {
-								// Do not fail, output empty set
-							} else {
-								returnData.push({
-									json: { results: [] },
-									pairedItem: { item: i },
-								});
-							}
-							continue;
-						}
+						const promptText = this.getNodeParameter('prompt', i) as string;
 						const embedder = await this.getInputConnectionData('ai_embedding', i);
 						if (!embedder) {
 							throw new NodeOperationError(
@@ -1362,7 +936,6 @@ export class MongoDbVectorSearch implements INodeType {
 						},
 					];
 
-					// We need the score field if includeScore is true OR if a similarity threshold is specified
 					if (includeScore || similarityThreshold > 0) {
 						pipeline.push({
 							$addFields: {
@@ -1371,7 +944,6 @@ export class MongoDbVectorSearch implements INodeType {
 						});
 					}
 
-					// Add match stage for threshold if set
 					if (similarityThreshold > 0) {
 						pipeline.push({
 							$match: {
@@ -1390,9 +962,8 @@ export class MongoDbVectorSearch implements INodeType {
 						Object.assign(projectStage, optionsProject);
 					}
 
-					// Auto-include similarity score if an inclusion projection is defined
 					if (includeScore && Object.keys(projectStage).length > 0) {
-						const isInclusion = Object.values(projectStage).some(val => val === 1 || val === true);
+						const isInclusion = Object.values(projectStage).some((val) => val === 1 || val === true);
 						if (isInclusion) {
 							projectStage[scoreFieldName] = 1;
 						}
@@ -1407,7 +978,6 @@ export class MongoDbVectorSearch implements INodeType {
 					} else {
 						results = await collection.aggregate(pipeline, { maxTimeMS }).toArray();
 					}
-
 				} else if (operation === 'find') {
 					const queryRaw = this.getNodeParameter('query', i, '{}') as string;
 					const query = parseJson(this, queryRaw, 'Query', jsonFormatting);
@@ -1455,7 +1025,6 @@ export class MongoDbVectorSearch implements INodeType {
 					} else {
 						results = await cursor.toArray();
 					}
-
 				} else if (operation === 'customSearch') {
 					const customType = this.getNodeParameter('customType', i) as string;
 
@@ -1466,7 +1035,7 @@ export class MongoDbVectorSearch implements INodeType {
 						const skip = this.getNodeParameter('skipCustom', i) as number;
 
 						let cursor = collection.find(query);
-						
+
 						if (Object.keys(optionsProject).length > 0 || forceProject) {
 							cursor = cursor.project(optionsProject);
 						}
@@ -1512,7 +1081,6 @@ export class MongoDbVectorSearch implements INodeType {
 						pairedItem: { item: i },
 					});
 				}
-
 			} catch (error) {
 				if (this.continueOnFail()) {
 					returnData.push({
