@@ -135,6 +135,11 @@ function sanitizeSortDirection(value: any): 1 | -1 {
 	if (value === -1 || value === '-1' || value === 'desc' || value === 'descending') {
 		return -1;
 	}
+	if (typeof value === 'string') {
+		const lower = value.toLowerCase().trim();
+		if (lower === 'asc' || lower === 'ascending' || lower === '1') return 1;
+		if (lower === 'desc' || lower === 'descending' || lower === '-1') return -1;
+	}
 	if (typeof value === 'object' && value !== null) {
 		if (value.$meta !== undefined) {
 			return -1;
@@ -148,7 +153,29 @@ function sanitizeSortDirection(value: any): 1 | -1 {
 }
 
 function sanitizeSortDocument(sortObj: any): any {
-	if (!sortObj || typeof sortObj !== 'object') return null;
+	if (!sortObj) return null;
+
+	if (typeof sortObj === 'string') {
+		const trimmed = sortObj.trim();
+		if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+			try {
+				const parsed = JSON.parse(trimmed);
+				return sanitizeSortDocument(parsed);
+			} catch (_) {}
+		}
+		const cleanSort: any = {};
+		if (trimmed.startsWith('-')) {
+			cleanSort[trimmed.substring(1).trim()] = -1;
+		} else if (trimmed.startsWith('+')) {
+			cleanSort[trimmed.substring(1).trim()] = 1;
+		} else {
+			const parts = trimmed.split(/\s+/);
+			const field = parts[0];
+			const dir = parts.length > 1 ? sanitizeSortDirection(parts[1]) : -1;
+			cleanSort[field] = dir;
+		}
+		return Object.keys(cleanSort).length > 0 ? cleanSort : null;
+	}
 
 	if (Array.isArray(sortObj)) {
 		const cleanSort: any = {};
@@ -156,19 +183,23 @@ function sanitizeSortDocument(sortObj: any): any {
 			if (Array.isArray(item) && item.length >= 2) {
 				const field = String(item[0]);
 				cleanSort[field] = sanitizeSortDirection(item[1]);
-			} else if (typeof item === 'string') {
-				cleanSort[item] = 1;
+			} else if (typeof item === 'string' || (typeof item === 'object' && item !== null)) {
+				const parsed = sanitizeSortDocument(item);
+				if (parsed) Object.assign(cleanSort, parsed);
 			}
 		}
 		return Object.keys(cleanSort).length > 0 ? cleanSort : null;
 	}
 
-	const cleanSort: any = {};
-	for (const [key, value] of Object.entries(sortObj)) {
-		cleanSort[key] = sanitizeSortDirection(value);
+	if (typeof sortObj === 'object') {
+		const cleanSort: any = {};
+		for (const [key, value] of Object.entries(sortObj)) {
+			cleanSort[key] = sanitizeSortDirection(value);
+		}
+		return Object.keys(cleanSort).length > 0 ? cleanSort : null;
 	}
 
-	return Object.keys(cleanSort).length > 0 ? cleanSort : null;
+	return null;
 }
 
 
@@ -760,12 +791,12 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 		};
 
 		const aiSearchSchema = z.object({
-			query: z.string().optional().describe('Text search prompt to fuzzy match fields or search query'),
-			filter: z.record(z.any()).optional().describe('MongoDB query filter object matching schema fields'),
+			query: z.string().optional().describe('Text search prompt to fuzzy match fields or search query (e.g. "Reichelt" or "Elektronik")'),
+			filter: z.union([z.record(z.any()), z.string()]).optional().describe('MongoDB query filter object matching schema fields. Example: {"status": "active"}'),
 			id: z.string().optional().describe('Exact MongoDB document ID (_id)'),
-			skip: z.number().optional().describe('Number of records to skip for pagination'),
-			limit: z.number().optional().describe('Number of records to return'),
-			sort: z.record(z.any()).optional().describe('MongoDB sort document'),
+			skip: z.number().optional().describe('Number of records to skip for pagination (default: 0)'),
+			limit: z.number().optional().describe('Number of records to return (default: 10)'),
+			sort: z.union([z.record(z.any()), z.string(), z.array(z.any())]).optional().describe('MongoDB sort document. Example: {"Geändert": -1} for newest modified records first, or {"createdAt": 1} for oldest first.'),
 		});
 
 		const tool = new DynamicStructuredTool({
