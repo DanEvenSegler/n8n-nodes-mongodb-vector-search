@@ -413,7 +413,22 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 	): Promise<DocumentInterface[]> {
 		const cleanQuery = extractQueryString(query);
 		if (!cleanQuery) return [];
-		const vector = await this.embeddings.embedQuery(cleanQuery);
+
+		if (!this.embeddings || typeof this.embeddings.embedQuery !== 'function') {
+			throw new Error('Connected Embedding Model is invalid or missing embedQuery method.');
+		}
+
+		let vector: number[];
+		try {
+			vector = await this.embeddings.embedQuery(cleanQuery);
+		} catch (embedError) {
+			throw new Error(`Failed to generate embedding vector using connected model: ${(embedError as Error).message}`);
+		}
+
+		if (!vector || !Array.isArray(vector) || vector.length === 0) {
+			throw new Error(`Embedding Model returned an invalid or empty vector array for query "${cleanQuery}".`);
+		}
+
 		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter);
 		return results.map(([doc]) => doc);
 	}
@@ -825,11 +840,16 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 			filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
 		}
 
-		const embedder = (await this.getInputConnectionData('ai_embedding', itemIndex)) as EmbeddingsInterface;
-		if (!embedder) {
+		let embedderRaw = await this.getInputConnectionData('ai_embedding', itemIndex);
+		if (Array.isArray(embedderRaw)) {
+			embedderRaw = embedderRaw[0];
+		}
+		const embedder = embedderRaw as EmbeddingsInterface;
+
+		if (!embedder || typeof embedder.embedQuery !== 'function') {
 			throw new NodeOperationError(
 				this.getNode(),
-				'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI Embeddings or Ollama Embeddings) to the node\'s Embedding Model input port.'
+				'No valid Embedding Model connected! Please connect an embedding model sub-node (like OpenAI Embeddings or Ollama Embeddings) to the node\'s Embedding Model input port.'
 			);
 		}
 
