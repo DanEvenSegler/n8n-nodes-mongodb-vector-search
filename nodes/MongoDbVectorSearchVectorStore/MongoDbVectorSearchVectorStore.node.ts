@@ -1,5 +1,7 @@
 import {
 	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
 	NodeOperationError,
@@ -780,5 +782,9 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		}
 
 		return { response: vectorStore };
+	}
+
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		return [this.helpers.returnJsonArray([])];
 	}
 }
