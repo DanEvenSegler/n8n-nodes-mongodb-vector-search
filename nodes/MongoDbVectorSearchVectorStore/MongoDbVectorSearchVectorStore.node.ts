@@ -189,6 +189,9 @@ export interface MongoDbVectorStoreOptions {
 	toolName?: string;
 	toolDescription?: string;
 	projectionOptions?: {
+		projectionMode?: string;
+		fieldsToInclude?: string;
+		fieldsToExclude?: string;
 		excludeEmbedding?: boolean;
 		excludeId?: boolean;
 	};
@@ -291,12 +294,39 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 
 		if (this.projectionOptions) {
 			const projectStage: any = {};
+			const mode = this.projectionOptions.projectionMode || 'all';
+
+			if (mode === 'include') {
+				const fields = (this.projectionOptions.fieldsToInclude || '')
+					.split(',')
+					.map((f: string) => f.trim())
+					.filter((f: string) => f !== '');
+				for (const f of fields) {
+					projectStage[f] = 1;
+				}
+				if (this.textField && !fields.includes(this.textField)) {
+					projectStage[this.textField] = 1;
+				}
+				if (Object.keys(projectStage).length === 0) {
+					projectStage._id = this.projectionOptions.excludeId ? 0 : 1;
+				}
+			} else if (mode === 'exclude') {
+				const fields = (this.projectionOptions.fieldsToExclude || '')
+					.split(',')
+					.map((f: string) => f.trim())
+					.filter((f: string) => f !== '');
+				for (const f of fields) {
+					projectStage[f] = 0;
+				}
+			}
+
 			if (this.projectionOptions.excludeEmbedding && this.embeddingField) {
 				projectStage[this.embeddingField] = 0;
 			}
 			if (this.projectionOptions.excludeId) {
 				projectStage._id = 0;
 			}
+
 			if (Object.keys(projectStage).length > 0) {
 				pipeline.push({ $project: projectStage });
 			}
@@ -319,12 +349,25 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			delete cleanedDoc._score;
 
 			let pageContent = '';
-			if (this.textField && cleanedDoc[this.textField] !== undefined) {
-				pageContent = typeof cleanedDoc[this.textField] === 'string'
-					? cleanedDoc[this.textField]
-					: JSON.stringify(cleanedDoc[this.textField]);
-			} else {
-				const { _id, ...rest } = cleanedDoc;
+			if (this.textField && cleanedDoc[this.textField] !== undefined && cleanedDoc[this.textField] !== null) {
+				const val = cleanedDoc[this.textField];
+				pageContent = typeof val === 'string' ? val : JSON.stringify(val);
+			}
+
+			if (!pageContent || pageContent.trim() === '' || pageContent === '{}') {
+				const entries: string[] = [];
+				for (const [key, value] of Object.entries(cleanedDoc)) {
+					if (key === '_id' || key === this.embeddingField) continue;
+					if (value !== null && value !== undefined) {
+						const formattedVal = typeof value === 'object' ? JSON.stringify(value) : String(value);
+						entries.push(`${key}: ${formattedVal}`);
+					}
+				}
+				pageContent = entries.join('\n');
+			}
+
+			if (!pageContent || pageContent.trim() === '') {
+				const { _id, [this.embeddingField]: _, ...rest } = cleanedDoc;
 				pageContent = JSON.stringify(rest);
 			}
 
@@ -502,11 +545,67 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 				placeholder: '{"status": "active"}',
 				description: 'Optional MongoDB filter document to restrict the search. E.g., {"status": "active"}. Evaluated within the $vectorSearch stage.',
 			},
+
+			// Projection Settings
+			{
+				displayName: 'Projection Mode',
+				name: 'projectionMode',
+				type: 'options',
+				options: [
+					{
+						name: 'Return All Fields',
+						value: 'all',
+					},
+					{
+						name: 'Include Only Specified Fields',
+						value: 'include',
+					},
+					{
+						name: 'Exclude Specified Fields',
+						value: 'exclude',
+					},
+				],
+				default: 'all',
+				description: 'Select how you want to filter/project the document fields for the AI Agent.',
+			},
+			{
+				displayName: 'Fields to Include',
+				name: 'fieldsToInclude',
+				type: 'string',
+				required: true,
+				displayOptions: {
+					show: {
+						projectionMode: ['include'],
+					},
+				},
+				default: '',
+				placeholder: 'title, description, price',
+				description: 'Comma-separated list of fields to include in the output.',
+			},
+			{
+				displayName: 'Fields to Exclude',
+				name: 'fieldsToExclude',
+				type: 'string',
+				required: true,
+				displayOptions: {
+					show: {
+						projectionMode: ['exclude'],
+					},
+				},
+				default: '',
+				placeholder: 'internal_id, password_hash',
+				description: 'Comma-separated list of fields to exclude from the output.',
+			},
 			{
 				displayName: 'Exclude ID Field (_id)',
 				name: 'excludeId',
 				type: 'boolean',
 				default: false,
+				displayOptions: {
+					show: {
+						projectionMode: ['all', 'include'],
+					},
+				},
 				description: 'Whether to exclude the default MongoDB _id field from the output.',
 			},
 			{
@@ -712,6 +811,9 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 
 		const db = client.db(dbName);
 
+		const projectionMode = this.getNodeParameter('projectionMode', itemIndex, 'all') as string;
+		const fieldsToInclude = this.getNodeParameter('fieldsToInclude', itemIndex, '') as string;
+		const fieldsToExclude = this.getNodeParameter('fieldsToExclude', itemIndex, '') as string;
 		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
 		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
 
@@ -750,6 +852,9 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 			toolName,
 			toolDescription,
 			projectionOptions: {
+				projectionMode,
+				fieldsToInclude,
+				fieldsToExclude,
 				excludeEmbedding,
 				excludeId,
 			},
