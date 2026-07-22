@@ -185,6 +185,7 @@ export interface MongoDbVectorStoreOptions {
 	limit?: number;
 	similarityThreshold?: number;
 	filterDefault?: any;
+	postFilterDefault?: any;
 	toolName?: string;
 	toolDescription?: string;
 	projectionOptions?: {
@@ -212,6 +213,8 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 	private filterDefault?: any;
 	private projectionOptions?: any;
 
+	public postFilterDefault?: any;
+
 	constructor(options: MongoDbVectorStoreOptions) {
 		super(options.embeddings, {});
 		this.db = options.db;
@@ -223,6 +226,7 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 		this.limit = options.limit || 10;
 		this.similarityThreshold = options.similarityThreshold || 0;
 		this.filterDefault = options.filterDefault;
+		this.postFilterDefault = options.postFilterDefault;
 		this.projectionOptions = options.projectionOptions;
 		this.name = options.toolName || 'mongodb_vector_search';
 		this.description = options.toolDescription || '';
@@ -243,13 +247,44 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 
 	async func(input: any): Promise<string> {
 		try {
-			const queryStr = extractQueryString(input);
-			if (!queryStr) {
-				return 'Please provide a non-empty search query string.';
+			let queryStr = '';
+			let dynamicPreFilter: any = null;
+			let dynamicPostFilter: any = null;
+			let dynamicLimit: number | undefined = undefined;
+
+			if (typeof input === 'string') {
+				const trimmed = input.trim();
+				if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+					try {
+						const parsed = JSON.parse(trimmed);
+						queryStr = parsed.query || parsed.input || parsed.prompt || parsed.search || parsed.text || '';
+						dynamicPreFilter = parsed.filter || parsed.preFilter || null;
+						dynamicPostFilter = parsed.postFilter || parsed.match || null;
+						dynamicLimit = parsed.limit || parsed.k || undefined;
+					} catch (_) {
+						queryStr = trimmed;
+					}
+				} else {
+					queryStr = trimmed;
+				}
+			} else if (typeof input === 'object' && input !== null) {
+				queryStr = input.query || input.input || input.prompt || input.search || input.text || extractQueryString(input);
+				dynamicPreFilter = input.filter || input.preFilter || null;
+				dynamicPostFilter = input.postFilter || input.match || null;
+				dynamicLimit = input.limit || input.k || undefined;
 			}
-			const docs = await this.similaritySearch(queryStr, this.limit);
+
+			if (!queryStr) {
+				return 'Please provide a non-empty search query string or JSON object containing {"query": "..."}.';
+			}
+
+			const limitToUse = typeof dynamicLimit === 'number' && dynamicLimit > 0 ? dynamicLimit : this.limit;
+			const docs = await this.similaritySearchWithFilters(queryStr, limitToUse, dynamicPreFilter, dynamicPostFilter);
+
 			if (!docs || docs.length === 0) {
-				return `No matching documents found in MongoDB collection "${this.collectionName}" for search query "${queryStr}".`;
+				const filterNotice = this.filterDefault || dynamicPreFilter ? ` (Pre-filter active)` : '';
+				const postFilterNotice = this.postFilterDefault || dynamicPostFilter ? ` (Post-filter active)` : '';
+				return `No matching documents found in MongoDB collection "${this.collectionName}" for search query "${queryStr}"${filterNotice}${postFilterNotice}.`;
 			}
 			return docs.map((d) => d.pageContent).join('\n---\n');
 		} catch (err) {
@@ -260,7 +295,8 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 	async similaritySearchVectorWithScore(
 		query: number[],
 		k: number,
-		filter?: Record<string, any> | string
+		filter?: Record<string, any> | string,
+		postFilter?: Record<string, any> | string
 	): Promise<[DocumentInterface, number][]> {
 		const collection = this.db.collection(this.collectionName);
 		const limitToUse = k || this.limit || 10;
@@ -273,27 +309,28 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			limit: limitToUse,
 		};
 
-		let combinedFilter: any = null;
+		// 1. PRE-FILTER ($vectorSearch.filter)
+		let combinedPreFilter: any = null;
 		if (this.filterDefault && Object.keys(this.filterDefault).length > 0) {
-			combinedFilter = { ...this.filterDefault };
+			combinedPreFilter = { ...this.filterDefault };
 		}
 
 		if (filter) {
 			let parsedFilter: any = filter;
 			if (typeof filter === 'string') {
 				try {
-					parsedFilter = JSON.parse(filter);
+					parsedFilter = BSON.EJSON.parse(filter);
 				} catch (_) {
 					parsedFilter = null;
 				}
 			}
 			if (parsedFilter && typeof parsedFilter === 'object' && Object.keys(parsedFilter).length > 0) {
-				combinedFilter = combinedFilter ? { $and: [combinedFilter, parsedFilter] } : parsedFilter;
+				combinedPreFilter = combinedPreFilter ? { $and: [combinedPreFilter, parsedFilter] } : parsedFilter;
 			}
 		}
 
-		if (combinedFilter) {
-			vectorSearchStage.filter = combinedFilter;
+		if (combinedPreFilter) {
+			vectorSearchStage.filter = combinedPreFilter;
 		}
 
 		const pipeline: any[] = [
@@ -307,12 +344,33 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			},
 		];
 
+		// 2. POST-FILTER ($match stage after $vectorSearch)
+		let combinedPostFilter: any = null;
+		if (this.postFilterDefault && Object.keys(this.postFilterDefault).length > 0) {
+			combinedPostFilter = { ...this.postFilterDefault };
+		}
+
+		if (postFilter) {
+			let parsedPostFilter: any = postFilter;
+			if (typeof postFilter === 'string') {
+				try {
+					parsedPostFilter = BSON.EJSON.parse(postFilter);
+				} catch (_) {
+					parsedPostFilter = null;
+				}
+			}
+			if (parsedPostFilter && typeof parsedPostFilter === 'object' && Object.keys(parsedPostFilter).length > 0) {
+				combinedPostFilter = combinedPostFilter ? { $and: [combinedPostFilter, parsedPostFilter] } : parsedPostFilter;
+			}
+		}
+
 		if (this.similarityThreshold > 0) {
-			pipeline.push({
-				$match: {
-					_score: { $gte: this.similarityThreshold },
-				},
-			});
+			const thresholdCondition = { _score: { $gte: this.similarityThreshold } };
+			combinedPostFilter = combinedPostFilter ? { $and: [combinedPostFilter, thresholdCondition] } : thresholdCondition;
+		}
+
+		if (combinedPostFilter && Object.keys(combinedPostFilter).length > 0) {
+			pipeline.push({ $match: combinedPostFilter });
 		}
 
 		if (this.projectionOptions) {
@@ -406,10 +464,11 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 		return results;
 	}
 
-	async similaritySearch(
+	async similaritySearchWithFilters(
 		query: string | any,
 		k?: number,
-		filter?: this['FilterType']
+		filter?: this['FilterType'],
+		postFilter?: Record<string, any> | string
 	): Promise<DocumentInterface[]> {
 		const cleanQuery = extractQueryString(query);
 		if (!cleanQuery) return [];
@@ -429,8 +488,16 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 			throw new Error(`Embedding Model returned an invalid or empty vector array for query "${cleanQuery}".`);
 		}
 
-		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter);
+		const results = await this.similaritySearchVectorWithScore(vector, k || this.limit, filter, postFilter);
 		return results.map(([doc]) => doc);
+	}
+
+	async similaritySearch(
+		query: string | any,
+		k?: number,
+		filter?: this['FilterType']
+	): Promise<DocumentInterface[]> {
+		return this.similaritySearchWithFilters(query, k, filter, undefined);
 	}
 
 	async addVectors(
@@ -577,12 +644,20 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 				description: 'Only return results with a similarity score greater than or equal to this threshold. Set to 0 to disable.',
 			},
 			{
-				displayName: 'Filter',
+				displayName: 'Pre-Filter ($vectorSearch.filter)',
 				name: 'filter',
 				type: 'string',
 				default: '',
 				placeholder: '{"status": "active"}',
-				description: 'Optional MongoDB filter document to restrict the search. E.g., {"status": "active"}. Evaluated within the $vectorSearch stage.',
+				description: 'Optional MongoDB pre-filter document evaluated inside $vectorSearch stage before computing vectors. Requires indexed fields in MongoDB Search Index.',
+			},
+			{
+				displayName: 'Post-Filter ($match)',
+				name: 'postFilter',
+				type: 'string',
+				default: '',
+				placeholder: '{"price": {"$gte": 50}}',
+				description: 'Optional MongoDB post-filter evaluated as a $match stage AFTER vector search. Can filter on any document field (indexed or non-indexed).',
 			},
 
 			// Projection Settings
@@ -832,12 +907,18 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		const limit = this.getNodeParameter('limit', itemIndex, 10) as number;
 		const similarityThreshold = this.getNodeParameter('similarityThreshold', itemIndex, 0) as number;
 		const filterRaw = this.getNodeParameter('filter', itemIndex, '') as string;
+		const postFilterRaw = this.getNodeParameter('postFilter', itemIndex, '') as string;
 		const nodeOptions = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
 		const jsonFormatting = nodeOptions.hasOwnProperty('jsonFormatting') ? !!nodeOptions.jsonFormatting : true;
 
 		let filterDefault: any = null;
 		if (filterRaw && filterRaw.trim() !== '') {
-			filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
+			filterDefault = parseJson(this, filterRaw, 'Pre-Filter', jsonFormatting);
+		}
+
+		let postFilterDefault: any = null;
+		if (postFilterRaw && postFilterRaw.trim() !== '') {
+			postFilterDefault = parseJson(this, postFilterRaw, 'Post-Filter', jsonFormatting);
 		}
 
 		let embedderRaw = await this.getInputConnectionData('ai_embedding', itemIndex);
@@ -876,8 +957,22 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 
 		// Auto-generate tool description based on dropdowns and field settings if not specified by user
 		const textInfo = textField && textField.trim() !== '' ? ` (primary text field: "${textField.trim()}")` : '';
-		const filterInfo = filterRaw && filterRaw.trim() !== '' ? ` with pre-configured query filters` : '';
-		const autoDescription = `Use this tool to search the MongoDB collection "${collectionName}" (database: "${dbName}", index: "${indexName}")${textInfo} using vector similarity search${filterInfo}. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string describing what information you need to retrieve.`;
+		const filterInfo = filterRaw && filterRaw.trim() !== '' ? `\nPre-filter pre-configured: ${filterRaw.trim()}` : '';
+		const postFilterInfo = postFilterRaw && postFilterRaw.trim() !== '' ? `\nPost-filter pre-configured: ${postFilterRaw.trim()}` : '';
+		
+		const autoDescription = `Use this tool to search for documents, records, business partners, or information in the MongoDB collection "${collectionName}" (database: "${dbName}")${textInfo}.${filterInfo}${postFilterInfo}
+This tool performs a high-precision semantic vector search using index "${indexName}".
+
+WHEN TO USE:
+- Always call this tool when answering questions about entities, partners, products, or documents stored in MongoDB.
+
+HOW TO CALL:
+- Option A (Simple): Pass a clear search query string describing what you want to find (e.g., "Reichelt" or "Elektronik").
+- Option B (Structured JSON): Pass a JSON string/object with options:
+  * "query": (required string) search text prompt
+  * "filter": (optional object) pre-filter evaluated inside $vectorSearch
+  * "postFilter": (optional object) post-filter evaluated in $match stage after vector search
+  * "limit": (optional number) max results to return (default: ${limit})`;
 
 		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
 		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
@@ -893,6 +988,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 			limit,
 			similarityThreshold,
 			filterDefault,
+			postFilterDefault,
 			toolName,
 			toolDescription,
 			projectionOptions: {
