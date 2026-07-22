@@ -128,6 +128,49 @@ function cleanBsonTypes(obj: any): any {
 	return obj;
 }
 
+function sanitizeSortDirection(value: any): 1 | -1 {
+	if (value === 1 || value === '1' || value === 'asc' || value === 'ascending') {
+		return 1;
+	}
+	if (value === -1 || value === '-1' || value === 'desc' || value === 'descending') {
+		return -1;
+	}
+	if (typeof value === 'object' && value !== null) {
+		if (value.$meta !== undefined) {
+			return -1;
+		}
+		const orderVal = value.$order ?? value.order ?? value.dir ?? value.direction ?? value.sort;
+		if (orderVal !== undefined) {
+			return sanitizeSortDirection(orderVal);
+		}
+	}
+	return -1;
+}
+
+function sanitizeSortDocument(sortObj: any): any {
+	if (!sortObj || typeof sortObj !== 'object') return null;
+
+	if (Array.isArray(sortObj)) {
+		const cleanSort: any = {};
+		for (const item of sortObj) {
+			if (Array.isArray(item) && item.length >= 2) {
+				const field = String(item[0]);
+				cleanSort[field] = sanitizeSortDirection(item[1]);
+			} else if (typeof item === 'string') {
+				cleanSort[item] = 1;
+			}
+		}
+		return Object.keys(cleanSort).length > 0 ? cleanSort : null;
+	}
+
+	const cleanSort: any = {};
+	for (const [key, value] of Object.entries(sortObj)) {
+		cleanSort[key] = sanitizeSortDirection(value);
+	}
+
+	return Object.keys(cleanSort).length > 0 ? cleanSort : null;
+}
+
 
 
 interface SchemaFieldInfo {
@@ -666,8 +709,9 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 					cursor = cursor.project(projectStage);
 				}
 
-				if (customSort && Object.keys(customSort).length > 0) {
-					cursor = cursor.sort(customSort);
+				const cleanSort = sanitizeSortDocument(customSort);
+				if (cleanSort) {
+					cursor = cursor.sort(cleanSort);
 				}
 
 				if (requestedSkip > 0) {
