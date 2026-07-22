@@ -162,6 +162,8 @@ export interface MongoDbVectorStoreOptions {
 	limit?: number;
 	similarityThreshold?: number;
 	filterDefault?: any;
+	toolName?: string;
+	toolDescription?: string;
 	projectionOptions?: {
 		excludeEmbedding?: boolean;
 		excludeId?: boolean;
@@ -170,6 +172,9 @@ export interface MongoDbVectorStoreOptions {
 
 export class MongoDbAtlasVectorStore extends VectorStore {
 	declare FilterType: Record<string, any> | string;
+	public name: string;
+	public description: string;
+	public toolDescription: string;
 	private db: any;
 	private collectionName: string;
 	private indexName: string;
@@ -193,6 +198,9 @@ export class MongoDbAtlasVectorStore extends VectorStore {
 		this.similarityThreshold = options.similarityThreshold || 0;
 		this.filterDefault = options.filterDefault;
 		this.projectionOptions = options.projectionOptions;
+		this.name = options.toolName || 'mongodb_vector_search';
+		this.description = options.toolDescription || '';
+		this.toolDescription = options.toolDescription || '';
 	}
 
 	_vectorstoreType(): string {
@@ -855,6 +863,24 @@ export class MongoDbVectorSearch implements INodeType {
 						default: false,
 						description: 'Whether to return the query execution plan (explanation) instead of the actual documents.',
 					},
+					{
+						displayName: 'Tool Name',
+						name: 'toolName',
+						type: 'string',
+						default: 'mongodb_vector_search',
+						description: 'The name of the tool as exposed to the AI Agent. Must be lowercase alphanumeric with underscores.',
+					},
+					{
+						displayName: 'Tool Description',
+						name: 'toolDescription',
+						type: 'string',
+						typeOptions: {
+							rows: 4,
+						},
+						default: '',
+						placeholder: 'Use this tool to search the MongoDB vector database for relevant documents based on semantic similarity...',
+						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, an automatic description including the collection and database name will be generated.',
+					},
 				],
 			},
 		],
@@ -1027,6 +1053,10 @@ export class MongoDbVectorSearch implements INodeType {
 		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
 		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
 
+		const toolName = (nodeOptions.toolName as string) || 'mongodb_vector_search';
+		const defaultDescription = `Use this tool to search the MongoDB collection "${collectionName}" in database "${dbName}" using vector similarity search. Use this tool whenever you need to retrieve relevant documents, facts, or context to answer the user request. Pass a clear search query string as input.`;
+		const toolDescription = (nodeOptions.toolDescription as string) || defaultDescription;
+
 		const vectorStore = new MongoDbAtlasVectorStore({
 			embeddings: embedder,
 			db,
@@ -1038,6 +1068,8 @@ export class MongoDbVectorSearch implements INodeType {
 			limit,
 			similarityThreshold,
 			filterDefault,
+			toolName,
+			toolDescription,
 			projectionOptions: {
 				excludeEmbedding,
 				excludeId,
@@ -1049,8 +1081,8 @@ export class MongoDbVectorSearch implements INodeType {
 
 		if (connectedType === 'ai_tool') {
 			const tool = new DynamicTool({
-				name: 'mongodb_vector_search',
-				description: `Search the MongoDB Atlas collection "${collectionName}" using vector similarity search. Input should be a search query string.`,
+				name: toolName,
+				description: toolDescription,
 				func: async (input: string) => {
 					const docs = await vectorStore.similaritySearch(input, limit);
 					return docs.map(d => d.pageContent).join('\n---\n');
