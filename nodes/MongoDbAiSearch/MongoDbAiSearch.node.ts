@@ -400,7 +400,7 @@ export class MongoDbAiSearch implements INodeType {
 		defaults: {
 			name: 'MongoDB AI Search',
 		},
-		inputs: ['main'],
+		inputs: [],
 		outputs: [
 			{
 				type: 'ai_tool',
