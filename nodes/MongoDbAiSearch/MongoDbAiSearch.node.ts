@@ -253,7 +253,7 @@ async function analyzeCollectionSchema(
 	fieldsToExclude: string = '',
 	excludeId: boolean = false
 ): Promise<{ fields: SchemaFieldInfo[]; summaryText: string; stringFields: string[] }> {
-	const sampleDocs = await collection.find({}).limit(sampleCount).toArray();
+	const sampleDocs = await collection.find({}).sort({ _id: -1 }).limit(sampleCount).toArray();
 	const fieldMap: { [fieldName: string]: SchemaFieldInfo } = {};
 
 	const includeSet = new Set(
@@ -632,31 +632,55 @@ export class MongoDbAiSearch implements INodeType {
 			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
 			: autoToolName;
 
-		// Tool Description
+		const dateCandidateFields = schemaAnalysis.fields
+			.filter((f) =>
+				f.types.has('date') ||
+				f.name.toLowerCase().includes('date') ||
+				f.name.toLowerCase().includes('time') ||
+				f.name.toLowerCase().includes('datum') ||
+				f.name.toLowerCase().includes('geändert') ||
+				f.name.toLowerCase().includes('modified') ||
+				f.name.toLowerCase().includes('created') ||
+				f.name.toLowerCase().includes('updated') ||
+				f.name === '_id'
+			)
+			.map((f) => `"${f.name}"`);
+
+		const dateFieldsStr = dateCandidateFields.length > 0 ? dateCandidateFields.join(', ') : '"_id"';
+		const primaryDateField = dateCandidateFields.length > 0 ? dateCandidateFields[0].replace(/"/g, '') : '_id';
+
+		// Tool Description (100% Universal English Prompt)
 		const autoDescription = `Use this tool to search, query, filter, and inspect documents in the MongoDB collection "${collectionName}" (database: "${dbName}").
 
 COLLECTION SCHEMA OVERVIEW:
 ${schemaAnalysis.summaryText}
 
-WHEN TO USE THIS TOOL:
-- Call this tool whenever the user asks to find, filter, search, count, or retrieve records from "${collectionName}".
+CRITICAL DATABASE SEARCH RULES:
+- The database contains ALL records in the collection (not limited to the schema overview).
+- Every query executes database-wide across 100% of all documents in MongoDB.
+
+FOR SINGLE RECORD OR DATE SEARCHES (NEWEST / OLDEST / LATEST):
+- Detected date/time/ID fields for sorting in this collection: ${dateFieldsStr}
+- To find the single newest or last modified record, pass: {"sort": {"${primaryDateField}": -1}, "limit": 1}
+- To find the single oldest record, pass: {"sort": {"${primaryDateField}": 1}, "limit": 1}
+- Setting "limit": 1 instructs MongoDB to sort ALL documents database-wide and return ONLY the 1 single target record.
 
 HOW TO CALL THIS TOOL:
 1. Plain Text Search:
-   Pass a string search prompt (e.g., "paypal" or "Reichelt"). The tool will automatically perform a case-insensitive search across all text fields.
+   Pass a search string (e.g. "active" or "John"). The tool will perform a case-insensitive search across text fields.
 
-2. Structured JSON Filter (Recommended for exact filtering):
+2. Structured JSON Filter (Recommended for exact filtering and sorting):
    Pass a JSON object with any of the following parameters:
    - "query": (optional string) text search term to fuzzy match string fields.
-   - "filter": (optional object) exact MongoDB query filter matching schema fields above. Example: {"payment_method": "paypal", "status": "active"}.
+   - "filter": (optional object) exact MongoDB query filter matching schema fields above. Example: {"status": "active"}.
    - "id": (optional string) exact MongoDB document ID (_id) to retrieve.
    - "skip": (optional number) number of records to skip for pagination (default: 0).
-   - "limit": (optional number) number of records to return (default: ${defaultLimit}, max: ${maxLimit}).
-   - "sort": (optional object) MongoDB sort document. Example: {"createdAt": -1}.
+   - "limit": (optional number) number of records to return (default: ${defaultLimit}, max: ${maxLimit}). Set "limit": 1 when retrieving a single newest/oldest record.
+   - "sort": (optional object) MongoDB sort document. Example: {"${primaryDateField}": -1} for newest records first.
 
-PAGINATION & METADATA:
-The tool returns a JSON response containing pagination metadata ("totalCount", "returnedCount", "skip", "hasMore", "nextSkip") along with the document results.
-If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the next page of records.`;
+PAGINATION & MORE DATA:
+The tool returns pagination metadata ("totalCount", "returnedCount", "skip", "hasMore", "nextSkip").
+If "hasMore" is true, inform the user how many total records exist (e.g., "Found totalCount total records, showing returnedCount. Ask if you want to see the remaining records.") and call tool again with "skip": <nextSkip> if requested.`;
 
 		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
 		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
