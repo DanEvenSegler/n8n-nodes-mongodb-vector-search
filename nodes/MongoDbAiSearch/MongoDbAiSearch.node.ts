@@ -270,6 +270,23 @@ function resolveObjectIds(obj: any): any {
 	return obj;
 }
 
+function sanitizeToolName(name: string): string {
+	if (!name) return '';
+	return name
+		.trim()
+		.replace(/ä/g, 'ae')
+		.replace(/ö/g, 'oe')
+		.replace(/ü/g, 'ue')
+		.replace(/ß/g, 'ss')
+		.replace(/Ä/g, 'ae')
+		.replace(/Ö/g, 'oe')
+		.replace(/Ü/g, 'ue')
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, '_')
+		.replace(/_+/g, '_')
+		.replace(/^_|_$/g, '');
+}
+
 
 
 
@@ -695,17 +712,13 @@ export class MongoDbAiSearch implements INodeType {
 			excludeId
 		);
 
-		// Tool Name
-		const sanitizedCol = (collectionName || 'mongodb_collection')
-			.toLowerCase()
-			.replace(/[^a-z0-9_]/g, '_')
-			.replace(/_+/g, '_')
-			.replace(/^_|_$/g, '');
+		// Tool Name Generation with German Umlaut Transliteration
+		const sanitizedCol = sanitizeToolName(collectionName || 'mongodb_collection');
 		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'search_mongodb';
 
 		const toolNameRaw = (nodeOptions.toolName as string) || '';
 		const toolName = toolNameRaw.trim() !== ''
-			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
+			? sanitizeToolName(toolNameRaw)
 			: autoToolName;
 
 		const dateCandidateFields = schemaAnalysis.fields
