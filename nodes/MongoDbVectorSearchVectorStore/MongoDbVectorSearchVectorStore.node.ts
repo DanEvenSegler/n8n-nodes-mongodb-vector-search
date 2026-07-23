@@ -552,6 +552,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 				type: 'ai_embedding',
 				displayName: 'Embedding Model',
 				required: true,
+				maxConnections: 1,
 			},
 		],
 		outputs: [
@@ -923,7 +924,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 			postFilterDefault = parseJson(this, postFilterRaw, 'Post-Filter', jsonFormatting);
 		}
 
-		let embedderRaw = await this.getInputConnectionData('ai_embedding', itemIndex);
+		let embedderRaw = await this.getInputConnectionData('ai_embedding', 0);
 		if (Array.isArray(embedderRaw)) {
 			embedderRaw = embedderRaw[0];
 		}
@@ -1073,7 +1074,7 @@ HOW TO CALL:
 					filterDefault = parseJson(this, filterRaw, 'Filter', jsonFormatting);
 				}
 
-				let embedderRaw = await this.getInputConnectionData('ai_embedding', i);
+				let embedderRaw = await this.getInputConnectionData('ai_embedding', 0);
 				if (Array.isArray(embedderRaw)) {
 					embedderRaw = embedderRaw[0];
 				}

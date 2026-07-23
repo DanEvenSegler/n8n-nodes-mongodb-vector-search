@@ -876,7 +876,7 @@ export class MongoDbVectorSearch implements INodeType {
 
 					if (queryType === 'prompt') {
 						const promptText = this.getNodeParameter('prompt', i) as string;
-						const embedder = await this.getInputConnectionData('ai_embedding', i);
+						const embedder = await this.getInputConnectionData('ai_embedding', 0);
 						if (!embedder) {
 							throw new NodeOperationError(
 								this.getNode(),
