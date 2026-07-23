@@ -330,10 +330,17 @@ async function analyzeCollectionSchema(
 				fieldMap[key].types.add('number');
 			} else if (typeof value === 'boolean') {
 				fieldMap[key].types.add('boolean');
+			} else if (value instanceof Date) {
+				fieldMap[key].types.add('date');
 			} else if (typeof value === 'string') {
-				fieldMap[key].types.add('string');
-				if (value.trim() !== '' && fieldMap[key].sampleValues.size < 5) {
-					fieldMap[key].sampleValues.add(value.trim());
+				const trimmedVal = value.trim();
+				if (/^\d{4}-\d{2}-\d{2}/.test(trimmedVal) || /^\d{1,2}\.\d{1,2}\.\d{4}/.test(trimmedVal)) {
+					fieldMap[key].types.add('date');
+				} else {
+					fieldMap[key].types.add('string');
+				}
+				if (trimmedVal !== '' && fieldMap[key].sampleValues.size < 5) {
+					fieldMap[key].sampleValues.add(trimmedVal);
 				}
 			} else {
 				fieldMap[key].types.add(typeof value);
@@ -668,17 +675,7 @@ export class MongoDbAiSearch implements INodeType {
 			: autoToolName;
 
 		const dateCandidateFields = schemaAnalysis.fields
-			.filter((f) =>
-				f.types.has('date') ||
-				f.name.toLowerCase().includes('date') ||
-				f.name.toLowerCase().includes('time') ||
-				f.name.toLowerCase().includes('datum') ||
-				f.name.toLowerCase().includes('geändert') ||
-				f.name.toLowerCase().includes('modified') ||
-				f.name.toLowerCase().includes('created') ||
-				f.name.toLowerCase().includes('updated') ||
-				f.name === '_id'
-			)
+			.filter((f) => f.name !== '_id' && f.types.has('date'))
 			.map((f) => `"${f.name}"`);
 
 		const dateFieldsStr = dateCandidateFields.length > 0 ? dateCandidateFields.join(', ') : '"_id"';
@@ -839,7 +836,14 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 
 				// Execute Query
 				const totalCount = await collection.countDocuments(finalQuery);
-				const cleanSort = sanitizeSortDocument(customSort);
+				let cleanSort = sanitizeSortDocument(customSort);
+				if (cleanSort && Object.keys(cleanSort).length === 1 && Object.keys(cleanSort)[0] === '_id') {
+					if (primaryDateField && primaryDateField !== '_id') {
+						const sortDir = cleanSort._id;
+						cleanSort = { [primaryDateField]: sortDir, _id: sortDir };
+					}
+				}
+
 				let docs: any[] = [];
 
 				if (cleanSort && Object.keys(cleanSort).length > 0) {
