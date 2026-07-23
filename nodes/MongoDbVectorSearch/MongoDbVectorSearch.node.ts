@@ -876,14 +876,20 @@ export class MongoDbVectorSearch implements INodeType {
 
 					if (queryType === 'prompt') {
 						const promptText = this.getNodeParameter('prompt', i) as string;
-						const embedder = await this.getInputConnectionData('ai_embedding', 0);
-						if (!embedder) {
+						let embedderRaw: any = await this.getInputConnectionData('ai_embedding', 0);
+						if (Array.isArray(embedderRaw)) {
+							embedderRaw = embedderRaw[0];
+						}
+						if (embedderRaw && typeof embedderRaw === 'object' && 'response' in embedderRaw) {
+							embedderRaw = embedderRaw.response;
+						}
+						if (!embedderRaw) {
 							throw new NodeOperationError(
 								this.getNode(),
 								'No Embedding Model connected! Please connect an embedding model sub-node (like OpenAI or Ollama) to the node\'s Embedding Model input port.'
 							);
 						}
-						const resolvedEmbedder = Array.isArray(embedder) ? embedder[0] : embedder;
+						const resolvedEmbedder = embedderRaw;
 						if (typeof resolvedEmbedder.embedQuery !== 'function') {
 							throw new NodeOperationError(
 								this.getNode(),
