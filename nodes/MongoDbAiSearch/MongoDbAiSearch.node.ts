@@ -152,25 +152,60 @@ function sanitizeSortDirection(value: any): 1 | -1 {
 	return -1;
 }
 
+function cleanFieldName(name: string): string {
+	if (!name) return name;
+	return name.trim().replace(/^["'\\]+|["'\\]+$/g, '').replace(/\\"/g, '"').replace(/\\'/g, "'").trim();
+}
+
+function truncateStringValue(str: string, maxLength: number = 300): string {
+	if (!str || str.length <= maxLength) return str;
+	const clean = str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+	if (clean.length <= maxLength) return clean;
+	return clean.substring(0, maxLength) + '... (truncated for context safety)';
+}
+
+function sanitizeDocForLlm(doc: any, maxStringLen: number = 300): any {
+	if (doc === null || doc === undefined) return doc;
+	if (typeof doc === 'string') {
+		return truncateStringValue(doc, maxStringLen);
+	}
+	if (Array.isArray(doc)) {
+		return doc.map((item) => sanitizeDocForLlm(item, maxStringLen));
+	}
+	if (typeof doc === 'object') {
+		const cleanObj: any = {};
+		for (const [key, value] of Object.entries(doc)) {
+			const cleanKey = cleanFieldName(key);
+			cleanObj[cleanKey] = sanitizeDocForLlm(value, maxStringLen);
+		}
+		return cleanObj;
+	}
+	return doc;
+}
+
 function sanitizeSortDocument(sortObj: any): any {
 	if (!sortObj) return null;
 
 	if (typeof sortObj === 'string') {
-		const trimmed = sortObj.trim();
-		if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+		let trimmed = sortObj.trim();
+		// Handle JSON string or double-stringified JSON
+		if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('"{') && trimmed.endsWith('}"'))) {
 			try {
+				if (trimmed.startsWith('"')) {
+					trimmed = JSON.parse(trimmed);
+				}
 				const parsed = JSON.parse(trimmed);
 				return sanitizeSortDocument(parsed);
 			} catch (_) {}
 		}
 		const cleanSort: any = {};
 		if (trimmed.startsWith('-')) {
-			cleanSort[trimmed.substring(1).trim()] = -1;
+			cleanSort[cleanFieldName(trimmed.substring(1))] = -1;
 		} else if (trimmed.startsWith('+')) {
-			cleanSort[trimmed.substring(1).trim()] = 1;
+			cleanSort[cleanFieldName(trimmed.substring(1))] = 1;
 		} else {
 			const parts = trimmed.split(/\s+/);
-			const field = parts[0];
+			const field = cleanFieldName(parts[0]);
 			const dir = parts.length > 1 ? sanitizeSortDirection(parts[1]) : -1;
 			cleanSort[field] = dir;
 		}
@@ -181,7 +216,7 @@ function sanitizeSortDocument(sortObj: any): any {
 		const cleanSort: any = {};
 		for (const item of sortObj) {
 			if (Array.isArray(item) && item.length >= 2) {
-				const field = String(item[0]);
+				const field = cleanFieldName(String(item[0]));
 				cleanSort[field] = sanitizeSortDirection(item[1]);
 			} else if (typeof item === 'string' || (typeof item === 'object' && item !== null)) {
 				const parsed = sanitizeSortDocument(item);
@@ -194,7 +229,7 @@ function sanitizeSortDocument(sortObj: any): any {
 	if (typeof sortObj === 'object') {
 		const cleanSort: any = {};
 		for (const [key, value] of Object.entries(sortObj)) {
-			cleanSort[key] = sanitizeSortDirection(value);
+			cleanSort[cleanFieldName(key)] = sanitizeSortDirection(value);
 		}
 		return Object.keys(cleanSort).length > 0 ? cleanSort : null;
 	}
@@ -665,13 +700,18 @@ FOR SINGLE RECORD OR DATE SEARCHES (NEWEST / OLDEST / LATEST):
 - To find the single oldest record, pass: {"sort": {"${primaryDateField}": 1}, "limit": 1}
 - Setting "limit": 1 instructs MongoDB to sort ALL documents database-wide and return ONLY the 1 single target record.
 
+HOW TO SEARCH FREE-TEXT CONTENT VS FIELD FILTERING:
+- FREE-TEXT SEARCH (query): Use "query" to search for words, text, keywords, or phrases inside description and text fields across the entire collection (e.g. {"query": "hotline"}).
+- EXACT FIELD FILTERING (filter): Use "filter" when matching specific schema field names and values (e.g. {"filter": {"Aktiv": true}}).
+- COMBINED SEARCH & FILTERING: You can combine both in a single call! Example: {"query": "hotline", "filter": {"Aktiv": true}, "sort": {"${primaryDateField}": -1}}
+
 HOW TO CALL THIS TOOL:
 1. Plain Text Search:
    Pass a search string (e.g. "active" or "John"). The tool will perform a case-insensitive search across text fields.
 
 2. Structured JSON Filter (Recommended for exact filtering and sorting):
    Pass a JSON object with any of the following parameters:
-   - "query": (optional string) text search term to fuzzy match string fields.
+   - "query": (optional string) text search term to fuzzy match string fields across all text/description columns.
    - "filter": (optional object) exact MongoDB query filter matching schema fields above. Example: {"status": "active"}.
    - "id": (optional string) exact MongoDB document ID (_id) to retrieve.
    - "skip": (optional number) number of records to skip for pagination (default: 0).
@@ -872,8 +912,9 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 				}
 
 				const cleanedDocs = docs.map(cleanBsonTypes);
+				const llmSafeDocs = cleanedDocs.map((d) => sanitizeDocForLlm(d, 300));
 
-				const returnedCount = cleanedDocs.length;
+				const returnedCount = llmSafeDocs.length;
 				const hasMore = requestedSkip + returnedCount < totalCount;
 				const nextSkip = hasMore ? requestedSkip + returnedCount : null;
 
@@ -903,7 +944,7 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 							? `There are ${totalCount - (requestedSkip + returnedCount)} more records. Call tool again with "skip": ${nextSkip} to retrieve the next page.`
 							: 'All matching records have been retrieved.',
 					},
-					results: cleanedDocs,
+					results: llmSafeDocs,
 				}, null, 2);
 			} catch (err) {
 				return `Error executing MongoDB AI Search query: ${(err as Error).message}`;
