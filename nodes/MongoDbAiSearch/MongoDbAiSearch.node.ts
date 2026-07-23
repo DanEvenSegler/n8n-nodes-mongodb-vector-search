@@ -519,7 +519,18 @@ export class MongoDbAiSearch implements INodeType {
 						},
 						default: '',
 						placeholder: 'Use this tool to search customer records in MongoDB...',
-						description: 'Custom tool description. If left empty, a rich schema-aware description will be automatically generated.',
+						description: 'Custom tool description. If provided, it will completely overwrite the auto-generated description.',
+					},
+					{
+						displayName: 'Additional Description',
+						name: 'additionalDescription',
+						type: 'string',
+						typeOptions: {
+							rows: 4,
+						},
+						default: '',
+						placeholder: 'Use this collection to inspect employee vacation requests, leave balances, and approval statuses...',
+						description: 'Additional business context or usage instructions to append to the dynamically generated tool description (without overwriting the auto-generated schema overview and rules).',
 					},
 					{
 						displayName: 'Sample Document Count',
@@ -775,7 +786,13 @@ The tool returns pagination metadata ("totalCount", "returnedCount", "skip", "ha
 If "hasMore" is true, inform the user how many total records exist (e.g., "Found totalCount total records, showing returnedCount. Ask if you want to see the remaining records.") and call tool again with "skip": <nextSkip> if requested.`;
 
 		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
-		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
+		const additionalDescriptionRaw = (nodeOptions.additionalDescription as string) || '';
+
+		let toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
+
+		if (toolDescriptionRaw.trim() === '' && additionalDescriptionRaw.trim() !== '') {
+			toolDescription += `\n\nADDITIONAL BUSINESS CONTEXT & USAGE INSTRUCTIONS:\n${additionalDescriptionRaw.trim()}`;
+		}
 
 		// Execution Function for Tool
 		const toolFunc = async (input: any): Promise<string> => {
