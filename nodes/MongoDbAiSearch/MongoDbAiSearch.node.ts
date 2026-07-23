@@ -202,6 +202,28 @@ function sanitizeSortDocument(sortObj: any): any {
 	return null;
 }
 
+function parseFlexibleDate(val: any): number | null {
+	if (val === null || val === undefined) return null;
+	if (val instanceof Date) return val.getTime();
+	if (typeof val === 'number') return val;
+	if (typeof val === 'string') {
+		const str = val.trim();
+		const germanMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+		if (germanMatch) {
+			const day = parseInt(germanMatch[1], 10);
+			const month = parseInt(germanMatch[2], 10) - 1;
+			const year = parseInt(germanMatch[3], 10);
+			const hours = germanMatch[4] ? parseInt(germanMatch[4], 10) : 0;
+			const mins = germanMatch[5] ? parseInt(germanMatch[5], 10) : 0;
+			const secs = germanMatch[6] ? parseInt(germanMatch[6], 10) : 0;
+			return new Date(year, month, day, hours, mins, secs).getTime();
+		}
+		const parsed = Date.parse(str);
+		if (!isNaN(parsed)) return parsed;
+	}
+	return null;
+}
+
 
 
 interface SchemaFieldInfo {
@@ -752,6 +774,20 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 				cursor = cursor.limit(requestedLimit);
 				const docs = await cursor.toArray();
 				const cleanedDocs = docs.map(cleanBsonTypes);
+
+				// Perform flexible in-memory date sorting for German date strings (DD.MM.YYYY)
+				if (cleanSort) {
+					const sortField = Object.keys(cleanSort)[0];
+					const sortDir = cleanSort[sortField];
+					cleanedDocs.sort((a: any, b: any) => {
+						const timeA = parseFlexibleDate(a[sortField]);
+						const timeB = parseFlexibleDate(b[sortField]);
+						if (timeA !== null && timeB !== null) {
+							return sortDir === 1 ? timeA - timeB : timeB - timeA;
+						}
+						return 0;
+					});
+				}
 
 				const returnedCount = cleanedDocs.length;
 				const hasMore = requestedSkip + returnedCount < totalCount;
