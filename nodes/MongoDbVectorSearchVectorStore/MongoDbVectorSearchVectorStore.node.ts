@@ -547,24 +547,8 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		defaults: {
 			name: 'MongoDB Vector Search (AI)',
 		},
-		inputs: [
-			{
-				type: 'ai_embedding',
-				displayName: 'Embedding Model',
-				required: true,
-				maxConnections: 1,
-			},
-		],
-		outputs: [
-			{
-				type: 'ai_vectorStore',
-				displayName: 'Vector Store',
-			},
-			{
-				type: 'ai_tool',
-				displayName: 'Tool',
-			},
-		],
+		inputs: ['ai_embedding'],
+		outputs: ['ai_vectorStore', 'ai_tool'],
 		credentials: [
 			{
 				name: 'mongoDb',
@@ -1016,7 +1000,7 @@ HOW TO CALL:
 		(vectorStore as any).schema = vectorSearchSchema;
 
 		const nodeOutputs = this.getNodeOutputs();
-		const isToolOutput = nodeOutputs.some((o: any) => o.type === 'ai_tool');
+		const isToolOutput = nodeOutputs.some((o: any) => o === 'ai_tool' || o?.type === 'ai_tool' || o?.name === 'ai_tool' || o?.displayName === 'Tool');
 
 		if (isToolOutput) {
 			const tool = new DynamicStructuredTool({
