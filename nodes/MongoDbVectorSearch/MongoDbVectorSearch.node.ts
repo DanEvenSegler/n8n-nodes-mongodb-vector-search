@@ -159,7 +159,15 @@ export class MongoDbVectorSearch implements INodeType {
 		defaults: {
 			name: 'MongoDB Vector Search',
 		},
-		inputs: ['main', 'ai_embedding'],
+		inputs: [
+			'main',
+			{
+				type: 'ai_embedding',
+				displayName: 'Embedding Model',
+				required: true,
+				maxConnections: 1,
+			},
+		],
 		outputs: ['main'],
 		credentials: [
 			{
@@ -876,7 +884,7 @@ export class MongoDbVectorSearch implements INodeType {
 
 					if (queryType === 'prompt') {
 						const promptText = this.getNodeParameter('prompt', i) as string;
-						let embedderRaw: any = await this.getInputConnectionData('ai_embedding', i);
+						let embedderRaw: any = await this.getInputConnectionData('ai_embedding', i, 1);
 						if (Array.isArray(embedderRaw)) {
 							embedderRaw = embedderRaw[0];
 						}
