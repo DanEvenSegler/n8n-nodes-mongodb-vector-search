@@ -528,6 +528,34 @@ export class MongoDbAiSearch implements INodeType {
 						default: 50,
 						description: 'Number of sample documents to inspect for automatic schema and categorical value analysis.',
 					},
+					{
+						displayName: 'Allow Cross-Collection Joins ($lookup)',
+						name: 'allowJoins',
+						type: 'boolean',
+						default: true,
+						description: 'Whether to allow the AI Agent to perform $lookup joins across multiple collections. If disabled, join instructions are dynamically removed from the AI Agent prompt.',
+					},
+					{
+						displayName: 'Allow Custom Aggregation Pipelines ($pipeline)',
+						name: 'allowAggregations',
+						type: 'boolean',
+						default: true,
+						description: 'Whether to allow the AI Agent to execute custom $pipeline stages. If disabled, pipeline instructions are dynamically removed from the AI Agent prompt.',
+					},
+					{
+						displayName: 'Allow Categorical Grouping ($groupBy)',
+						name: 'allowGrouping',
+						type: 'boolean',
+						default: true,
+						description: 'Whether to allow the AI Agent to execute $groupBy categorical counts. If disabled, grouping instructions are dynamically removed from the AI Agent prompt.',
+					},
+					{
+						displayName: 'Allow Dynamic Field Mapping ($mapFields)',
+						name: 'allowFieldMapping',
+						type: 'boolean',
+						default: true,
+						description: 'Whether to allow the AI Agent to execute $mapFields field transformations. If disabled, mapping instructions are dynamically removed from the AI Agent prompt.',
+					},
 				],
 			},
 		],
@@ -575,17 +603,7 @@ export class MongoDbAiSearch implements INodeType {
 
 			async getCollections(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
 				const credentials = await this.getCredentials('mongoDb');
-				let dbName = this.getCurrentNodeParameter('database') as string;
-				if (!dbName) {
-					dbName = (credentials.database as string) || '';
-					if (!dbName && credentials.configurationType === 'connectionString') {
-						const uri = credentials.connectionString as string;
-						const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
-						if (match) {
-							dbName = match[1];
-						}
-					}
-				}
+				const dbName = this.getCurrentNodeParameter('database') as string;
 
 				if (!dbName) {
 					return [];
@@ -603,7 +621,7 @@ export class MongoDbAiSearch implements INodeType {
 						});
 					}
 				} catch (e) {
-					// Return empty list if fetch fails
+					// Fallback
 				}
 				results.sort((a, b) => a.name.localeCompare(b.name));
 				return results;
@@ -612,18 +630,18 @@ export class MongoDbAiSearch implements INodeType {
 	};
 
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
-		const credentials = await this.getCredentials('mongoDb', itemIndex);
+		const credentials = await this.getCredentials('mongoDb');
 		const client = await getMongoClient(this, credentials);
 
 		let dbName = this.getNodeParameter('database', itemIndex, '') as string;
-		if (!dbName) {
-			dbName = (credentials.database as string) || '';
-			if (!dbName && credentials.configurationType === 'connectionString') {
-				const uri = credentials.connectionString as string;
-				const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
-				if (match) {
-					dbName = match[1];
-				}
+		if (!dbName && credentials.database) {
+			dbName = credentials.database as string;
+		}
+		if (!dbName && credentials.configurationType === 'connectionString') {
+			const uri = credentials.connectionString as string;
+			const match = uri.match(/\/([a-zA-Z0-9_\-]+)(?:\?|$)/);
+			if (match) {
+				dbName = match[1];
 			}
 		}
 
@@ -647,6 +665,11 @@ export class MongoDbAiSearch implements INodeType {
 		const sampleCount = nodeOptions.hasOwnProperty('sampleDocumentCount')
 			? (nodeOptions.sampleDocumentCount as number)
 			: 50;
+
+		const allowJoins = nodeOptions.hasOwnProperty('allowJoins') ? (nodeOptions.allowJoins as boolean) : true;
+		const allowAggregations = nodeOptions.hasOwnProperty('allowAggregations') ? (nodeOptions.allowAggregations as boolean) : true;
+		const allowGrouping = nodeOptions.hasOwnProperty('allowGrouping') ? (nodeOptions.allowGrouping as boolean) : true;
+		const allowFieldMapping = nodeOptions.hasOwnProperty('allowFieldMapping') ? (nodeOptions.allowFieldMapping as boolean) : true;
 
 		const db = client.db(dbName);
 		const collection = db.collection(collectionName);
@@ -681,8 +704,47 @@ export class MongoDbAiSearch implements INodeType {
 		const dateFieldsStr = dateCandidateFields.length > 0 ? dateCandidateFields.join(', ') : '"_id"';
 		const primaryDateField = dateCandidateFields.length > 0 ? dateCandidateFields[0].replace(/"/g, '') : '_id';
 
+		// Dynamic Feature Section Generation
+		const capabilityLines: string[] = [
+			`- FREE-TEXT SEARCH (query): Use "query" to search for words, text, keywords, or phrases inside description and text fields across the entire collection (e.g. {"query": "hotline"}).`,
+			`- EXACT FIELD FILTERING (filter): Use "filter" when matching specific schema field names and values using native MongoDB query operators ($eq, $gt, $gte, $in, $or, $regex, $exists, $expr, etc.). Example: {"filter": {"status": "active"}}.`
+		];
+
+		const paramDocsLines: string[] = [
+			`   - "query": (optional string) text search term to fuzzy match string fields across all text/description columns.`,
+			`   - "filter": (optional object) native MongoDB query filter ($eq, $gt, $gte, $in, $or, $regex, $exists, $expr, etc.). Example: {"status": "active"}.`,
+			`   - "id": (optional string) exact MongoDB document ID (_id) to retrieve.`
+		];
+
+		if (allowJoins) {
+			capabilityLines.push(`- CROSS-COLLECTION JOINS (lookup): Pass "lookup" to perform Left Outer Joins with other MongoDB collections in database "${dbName}" (single object or array of lookup objects for joining 2, 4, or multiple collections). Example: {"lookup": [{"from": "Invoices", "localField": "KundenNR", "foreignField": "customer_nr", "as": "invoices"}, {"from": "Orders", "localField": "_id", "foreignField": "customer_id", "as": "orders"}]}.`);
+			paramDocsLines.push(`   - "lookup": (optional object or array) Left Outer Join(s) with other collection(s) in database "${dbName}". Single object or array of lookup objects for multiple collections.`);
+		}
+
+		if (allowFieldMapping) {
+			capabilityLines.push(`- DYNAMIC FIELD MAPPING (mapFields): Pass "mapFields" to dynamically rename or add calculated fields. Example: {"mapFields": {"displayName": "$EindeutigeBezeichnung"}}.`);
+			paramDocsLines.push(`   - "mapFields": (optional object) dynamic field mapping/renaming object. Example: {"displayName": "$EindeutigeBezeichnung"}.`);
+		}
+
+		if (allowGrouping) {
+			capabilityLines.push(`- GROUPING & CATEGORY COUNTS (groupBy): Pass a field name in "groupBy" to group documents by category and return record counts database-wide. Example: {"groupBy": "status"}.`);
+			paramDocsLines.push(`   - "groupBy": (optional string) field name to group documents by and return category counts database-wide. Example: "status".`);
+		}
+
+		if (allowAggregations) {
+			capabilityLines.push(`- CUSTOM AGGREGATION PIPELINES (pipeline): Pass custom MongoDB aggregation pipeline stages in "pipeline" (e.g. [{"$match": ...}, {"$lookup": ...}, {"$group": ...}]).`);
+			paramDocsLines.push(`   - "pipeline": (optional array) custom MongoDB Aggregation Pipeline stages array (e.g. [{"$match": ...}, {"$group": ...}]).`);
+		}
+
+		paramDocsLines.push(
+			`   - "selectFields": (optional array/string) specific field names to return in results. Example: ["name", "email"].`,
+			`   - "skip": (optional number) number of records to skip for pagination (default: 0).`,
+			`   - "limit": (optional number) number of records to return (default: ${defaultLimit}, max: ${maxLimit}). Set "limit": 1 when retrieving a single newest/oldest record.`,
+			`   - "sort": (optional object) MongoDB sort document on ANY field (e.g. {"${primaryDateField}": -1} for newest records, {"Prio": -1} for highest priority, {"ID": 1} for ID order, or any field name).`
+		);
+
 		// Tool Description (100% Universal English Prompt)
-		const autoDescription = `Use this tool to search, query, filter, and inspect documents in the MongoDB collection "${collectionName}" (database: "${dbName}").
+		const autoDescription = `Use this tool to search, query, filter, group, aggregate, and inspect documents in the MongoDB collection "${collectionName}" (database: "${dbName}").
 
 COLLECTION SCHEMA OVERVIEW:
 ${schemaAnalysis.summaryText}
@@ -692,28 +754,21 @@ CRITICAL DATABASE SEARCH RULES:
 - Every query executes database-wide across 100% of all documents in MongoDB.
 
 FOR SINGLE RECORD OR DATE SEARCHES (NEWEST / OLDEST / LATEST):
-- Detected date/time/ID fields for sorting in this collection: ${dateFieldsStr}
+- Detected date/time fields for sorting in this collection: ${dateFieldsStr}
 - To find the single newest or last modified record, pass: {"sort": {"${primaryDateField}": -1}, "limit": 1}
 - To find the single oldest record, pass: {"sort": {"${primaryDateField}": 1}, "limit": 1}
 - Setting "limit": 1 instructs MongoDB to sort ALL documents database-wide and return ONLY the 1 single target record.
 
-HOW TO SEARCH FREE-TEXT CONTENT VS FIELD FILTERING:
-- FREE-TEXT SEARCH (query): Use "query" to search for words, text, keywords, or phrases inside description and text fields across the entire collection (e.g. {"query": "hotline"}).
-- EXACT FIELD FILTERING (filter): Use "filter" when matching specific schema field names and values (e.g. {"filter": {"Aktiv": true}}).
-- COMBINED SEARCH & FILTERING: You can combine both in a single call! Example: {"query": "hotline", "filter": {"Aktiv": true}, "sort": {"${primaryDateField}": -1}}
+HOW TO SEARCH FREE-TEXT CONTENT VS FIELD FILTERING & AGGREGATION:
+${capabilityLines.join('\n')}
 
 HOW TO CALL THIS TOOL:
 1. Plain Text Search:
    Pass a search string (e.g. "active" or "John"). The tool will perform a case-insensitive search across text fields.
 
-2. Structured JSON Filter (Recommended for exact filtering and sorting):
+2. Structured JSON Filter & Aggregations (Recommended):
    Pass a JSON object with any of the following parameters:
-   - "query": (optional string) text search term to fuzzy match string fields across all text/description columns.
-   - "filter": (optional object) exact MongoDB query filter matching schema fields above. Example: {"status": "active"}.
-   - "id": (optional string) exact MongoDB document ID (_id) to retrieve.
-   - "skip": (optional number) number of records to skip for pagination (default: 0).
-   - "limit": (optional number) number of records to return (default: ${defaultLimit}, max: ${maxLimit}). Set "limit": 1 when retrieving a single newest/oldest record.
-   - "sort": (optional object) MongoDB sort document. Example: {"${primaryDateField}": -1} for newest records first.
+${paramDocsLines.join('\n')}
 
 PAGINATION & MORE DATA:
 The tool returns pagination metadata ("totalCount", "returnedCount", "skip", "hasMore", "nextSkip").
@@ -728,6 +783,11 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 				let searchText = '';
 				let customFilter: any = null;
 				let targetId: string | null = null;
+				let groupByField: string | null = null;
+				let customPipeline: any[] | null = null;
+				let selectFieldsInput: any = null;
+				let lookupParam: any = null;
+				let mapFieldsParam: any = null;
 				let requestedSkip = 0;
 				let requestedLimit = defaultLimit;
 				let customSort: any = null;
@@ -740,6 +800,11 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 							searchText = parsed.query || parsed.search || parsed.text || parsed.prompt || '';
 							customFilter = parsed.filter || parsed.where || null;
 							targetId = parsed.id || parsed._id || null;
+							groupByField = parsed.groupBy || parsed.countBy || parsed.group_by || null;
+							lookupParam = parsed.lookup || parsed.join || null;
+							mapFieldsParam = parsed.mapFields || parsed.map_fields || parsed.addFields || null;
+							if (Array.isArray(parsed.pipeline)) customPipeline = parsed.pipeline;
+							selectFieldsInput = parsed.selectFields || parsed.select || parsed.fields || null;
 							if (typeof parsed.skip === 'number') requestedSkip = Math.max(0, parsed.skip);
 							if (typeof parsed.limit === 'number') requestedLimit = Math.max(1, Math.min(parsed.limit, maxLimit));
 							if (parsed.sort && typeof parsed.sort === 'object') customSort = parsed.sort;
@@ -753,6 +818,11 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 					searchText = input.query || input.search || input.text || input.prompt || '';
 					customFilter = input.filter || input.where || null;
 					targetId = input.id || input._id || null;
+					groupByField = input.groupBy || input.countBy || input.group_by || null;
+					lookupParam = input.lookup || input.join || null;
+					mapFieldsParam = input.mapFields || input.map_fields || input.addFields || null;
+					if (Array.isArray(input.pipeline)) customPipeline = input.pipeline;
+					selectFieldsInput = input.selectFields || input.select || input.fields || null;
 					if (typeof input.skip === 'number') requestedSkip = Math.max(0, input.skip);
 					if (typeof input.limit === 'number') requestedLimit = Math.max(1, Math.min(input.limit, maxLimit));
 					if (input.sort && typeof input.sort === 'object') customSort = input.sort;
@@ -830,67 +900,137 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 					}
 				}
 
+				if (selectFieldsInput) {
+					const selectedList = Array.isArray(selectFieldsInput)
+						? selectFieldsInput
+						: String(selectFieldsInput).split(',').map((s) => s.trim()).filter(Boolean);
+					for (const sf of selectedList) {
+						const cleanSf = cleanFieldName(sf);
+						if (cleanSf) projectStage[cleanSf] = 1;
+					}
+				}
+
 				if (excludeId) {
 					projectStage._id = 0;
 				}
 
-				// Execute Query
-				const totalCount = await collection.countDocuments(finalQuery);
-				let cleanSort = sanitizeSortDocument(customSort);
-				if (cleanSort && Object.keys(cleanSort).length === 1 && Object.keys(cleanSort)[0] === '_id') {
-					if (primaryDateField && primaryDateField !== '_id') {
-						const sortDir = cleanSort._id;
-						cleanSort = { [primaryDateField]: sortDir, _id: sortDir };
+				const applyLookupAndMapping = (pipelineArr: any[]) => {
+					if (allowJoins && lookupParam) {
+						const lookupList = Array.isArray(lookupParam) ? lookupParam : [lookupParam];
+						for (const item of lookupList) {
+							if (item && typeof item === 'object') {
+								const fromCol = String(item.from || item.collection || '');
+								const localF = cleanFieldName(String(item.localField || item.local || ''));
+								const foreignF = cleanFieldName(String(item.foreignField || item.foreign || ''));
+								const asF = String(item.as || fromCol.toLowerCase());
+								if (fromCol && localF && foreignF) {
+									pipelineArr.push({
+										$lookup: {
+											from: fromCol,
+											localField: localF,
+											foreignField: foreignF,
+											as: asF,
+										},
+									});
+								}
+							}
+						}
 					}
-				}
+					if (allowFieldMapping && mapFieldsParam && typeof mapFieldsParam === 'object' && mapFieldsParam !== null) {
+						const cleanMap: any = {};
+						for (const [k, v] of Object.entries(mapFieldsParam)) {
+							cleanMap[cleanFieldName(k)] = v;
+						}
+						if (Object.keys(cleanMap).length > 0) {
+							pipelineArr.push({ $addFields: cleanMap });
+						}
+					}
+				};
 
+				// Execute Query / Aggregation
+				const totalCount = await collection.countDocuments(finalQuery);
 				let docs: any[] = [];
 
-				if (cleanSort && Object.keys(cleanSort).length > 0) {
-					const sortField = Object.keys(cleanSort)[0];
-					const sortDir = cleanSort[sortField];
+				if (allowAggregations && customPipeline && Array.isArray(customPipeline) && customPipeline.length > 0) {
+					const resolvedPipeline = customPipeline.map((stage) => resolveObjectIds(stage));
+					docs = await collection.aggregate(resolvedPipeline).toArray();
+				} else if (allowGrouping && groupByField && typeof groupByField === 'string' && groupByField.trim() !== '') {
+					const cleanGf = cleanFieldName(groupByField);
+					const groupPipeline: any[] = [];
+					if (Object.keys(finalQuery).length > 0) {
+						groupPipeline.push({ $match: finalQuery });
+					}
+					applyLookupAndMapping(groupPipeline);
+					groupPipeline.push({
+						$group: {
+							_id: `$${cleanGf}`,
+							count: { $sum: 1 },
+						},
+					});
+					groupPipeline.push({ $sort: { count: -1 } });
+					if (requestedSkip > 0) {
+						groupPipeline.push({ $skip: requestedSkip });
+					}
+					groupPipeline.push({ $limit: requestedLimit });
+
+					docs = await collection.aggregate(groupPipeline).toArray();
+				} else {
+					let cleanSort = sanitizeSortDocument(customSort);
+					if (cleanSort && Object.keys(cleanSort).length === 1 && Object.keys(cleanSort)[0] === '_id') {
+						if (primaryDateField && primaryDateField !== '_id') {
+							const sortDir = cleanSort._id;
+							cleanSort = { [primaryDateField]: sortDir, _id: sortDir };
+						}
+					}
 
 					const pipeline: any[] = [];
 					if (Object.keys(finalQuery).length > 0) {
 						pipeline.push({ $match: finalQuery });
 					}
 
-					pipeline.push({
-						$addFields: {
-							__parsedDate: {
-								$cond: {
-									if: { $eq: [{ $type: `$${sortField}` }, 'string'] },
-									then: {
-										$cond: {
-											if: { $regexMatch: { input: `$${sortField}`, regex: /^\d{1,2}\.\d{1,2}\.\d{4}/ } },
-											then: {
-												$concat: [
-													{ $substrCP: [`$${sortField}`, 6, 4] },
-													'-',
-													{ $substrCP: [`$${sortField}`, 3, 2] },
-													'-',
-													{ $substrCP: [`$${sortField}`, 0, 2] },
-													'T',
-													{
-														$cond: {
-															if: { $gt: [{ $strLenCP: `$${sortField}` }, 10] },
-															then: { $substrCP: [`$${sortField}`, 11, 8] },
-															else: '00:00:00',
+					applyLookupAndMapping(pipeline);
+
+					if (cleanSort && Object.keys(cleanSort).length > 0) {
+						const sortField = Object.keys(cleanSort)[0];
+						const sortDir = cleanSort[sortField];
+
+						pipeline.push({
+							$addFields: {
+								__parsedDate: {
+									$cond: {
+										if: { $eq: [{ $type: `$${sortField}` }, 'string'] },
+										then: {
+											$cond: {
+												if: { $regexMatch: { input: `$${sortField}`, regex: /^\d{1,2}\.\d{1,2}\.\d{4}/ } },
+												then: {
+													$concat: [
+														{ $substrCP: [`$${sortField}`, 6, 4] },
+														'-',
+														{ $substrCP: [`$${sortField}`, 3, 2] },
+														'-',
+														{ $substrCP: [`$${sortField}`, 0, 2] },
+														'T',
+														{
+															$cond: {
+																if: { $gt: [{ $strLenCP: `$${sortField}` }, 10] },
+																then: { $substrCP: [`$${sortField}`, 11, 8] },
+																else: '00:00:00',
+															},
 														},
-													},
-												],
+													],
+												},
+												else: `$${sortField}`,
 											},
-											else: `$${sortField}`,
 										},
+										else: `$${sortField}`,
 									},
-									else: `$${sortField}`,
 								},
 							},
-						},
-					});
+						});
 
-					pipeline.push({ $sort: { __parsedDate: sortDir } });
-					pipeline.push({ $project: { __parsedDate: 0 } });
+						pipeline.push({ $sort: { __parsedDate: sortDir } });
+						pipeline.push({ $project: { __parsedDate: 0 } });
+					}
 
 					if (Object.keys(projectStage).length > 0) {
 						pipeline.push({ $project: projectStage });
@@ -903,16 +1043,6 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 					pipeline.push({ $limit: requestedLimit });
 
 					docs = await collection.aggregate(pipeline).toArray();
-				} else {
-					let cursor = collection.find(finalQuery);
-					if (Object.keys(projectStage).length > 0) {
-						cursor = cursor.project(projectStage);
-					}
-					if (requestedSkip > 0) {
-						cursor = cursor.skip(requestedSkip);
-					}
-					cursor = cursor.limit(requestedLimit);
-					docs = await cursor.toArray();
 				}
 
 				const cleanedDocs = docs.map(cleanBsonTypes);
