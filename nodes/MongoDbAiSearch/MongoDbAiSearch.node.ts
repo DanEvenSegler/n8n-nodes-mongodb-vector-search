@@ -202,27 +202,40 @@ function sanitizeSortDocument(sortObj: any): any {
 	return null;
 }
 
-function parseFlexibleDate(val: any): number | null {
-	if (val === null || val === undefined) return null;
-	if (val instanceof Date) return val.getTime();
-	if (typeof val === 'number') return val;
-	if (typeof val === 'string') {
-		const str = val.trim();
-		const germanMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
-		if (germanMatch) {
-			const day = parseInt(germanMatch[1], 10);
-			const month = parseInt(germanMatch[2], 10) - 1;
-			const year = parseInt(germanMatch[3], 10);
-			const hours = germanMatch[4] ? parseInt(germanMatch[4], 10) : 0;
-			const mins = germanMatch[5] ? parseInt(germanMatch[5], 10) : 0;
-			const secs = germanMatch[6] ? parseInt(germanMatch[6], 10) : 0;
-			return new Date(year, month, day, hours, mins, secs).getTime();
+function resolveObjectIds(obj: any): any {
+	if (obj === null || obj === undefined) return obj;
+	if (typeof obj === 'string') {
+		if (ObjectId.isValid(obj) && obj.length === 24) {
+			try {
+				return new ObjectId(obj);
+			} catch (_) {
+				return obj;
+			}
 		}
-		const parsed = Date.parse(str);
-		if (!isNaN(parsed)) return parsed;
+		return obj;
 	}
-	return null;
+	if (Array.isArray(obj)) {
+		return obj.map(resolveObjectIds);
+	}
+	if (typeof obj === 'object') {
+		const newObj: any = {};
+		for (const [k, v] of Object.entries(obj)) {
+			if (k === '_id' && typeof v === 'string' && ObjectId.isValid(v)) {
+				try {
+					newObj[k] = new ObjectId(v);
+				} catch (_) {
+					newObj[k] = v;
+				}
+			} else {
+				newObj[k] = resolveObjectIds(v);
+			}
+		}
+		return newObj;
+	}
+	return obj;
 }
+
+
 
 
 
@@ -695,13 +708,19 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 					}
 				}
 
-				if (customFilter && typeof customFilter === 'object' && Object.keys(customFilter).length > 0) {
-					// Auto-resolve string ObjectIds in custom filter
-					const resolvedFilter = { ...customFilter };
-					if (resolvedFilter._id && typeof resolvedFilter._id === 'string' && ObjectId.isValid(resolvedFilter._id)) {
-						resolvedFilter._id = new ObjectId(resolvedFilter._id);
+				if (customFilter) {
+					let parsedFilter = customFilter;
+					if (typeof customFilter === 'string') {
+						const trimmed = customFilter.trim();
+						if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+							try {
+								parsedFilter = JSON.parse(trimmed);
+							} catch (_) {}
+						}
 					}
-					queryParts.push(resolvedFilter);
+					if (typeof parsedFilter === 'object' && parsedFilter !== null && Object.keys(parsedFilter).length > 0) {
+						queryParts.push(resolveObjectIds(parsedFilter));
+					}
 				}
 
 				if (searchText && searchText.trim() !== '') {
@@ -756,38 +775,79 @@ If "hasMore" is true, call this tool again with "skip": <nextSkip> to fetch the 
 
 				// Execute Query
 				const totalCount = await collection.countDocuments(finalQuery);
-				let cursor = collection.find(finalQuery);
-
-				if (Object.keys(projectStage).length > 0) {
-					cursor = cursor.project(projectStage);
-				}
-
 				const cleanSort = sanitizeSortDocument(customSort);
-				if (cleanSort) {
-					cursor = cursor.sort(cleanSort);
-				}
+				let docs: any[] = [];
 
-				if (requestedSkip > 0) {
-					cursor = cursor.skip(requestedSkip);
-				}
-
-				cursor = cursor.limit(requestedLimit);
-				const docs = await cursor.toArray();
-				const cleanedDocs = docs.map(cleanBsonTypes);
-
-				// Perform flexible in-memory date sorting for German date strings (DD.MM.YYYY)
-				if (cleanSort) {
+				if (cleanSort && Object.keys(cleanSort).length > 0) {
 					const sortField = Object.keys(cleanSort)[0];
 					const sortDir = cleanSort[sortField];
-					cleanedDocs.sort((a: any, b: any) => {
-						const timeA = parseFlexibleDate(a[sortField]);
-						const timeB = parseFlexibleDate(b[sortField]);
-						if (timeA !== null && timeB !== null) {
-							return sortDir === 1 ? timeA - timeB : timeB - timeA;
-						}
-						return 0;
+
+					const pipeline: any[] = [];
+					if (Object.keys(finalQuery).length > 0) {
+						pipeline.push({ $match: finalQuery });
+					}
+
+					pipeline.push({
+						$addFields: {
+							__parsedDate: {
+								$cond: {
+									if: { $eq: [{ $type: `$${sortField}` }, 'string'] },
+									then: {
+										$cond: {
+											if: { $regexMatch: { input: `$${sortField}`, regex: /^\d{1,2}\.\d{1,2}\.\d{4}/ } },
+											then: {
+												$concat: [
+													{ $substrCP: [`$${sortField}`, 6, 4] },
+													'-',
+													{ $substrCP: [`$${sortField}`, 3, 2] },
+													'-',
+													{ $substrCP: [`$${sortField}`, 0, 2] },
+													'T',
+													{
+														$cond: {
+															if: { $gt: [{ $strLenCP: `$${sortField}` }, 10] },
+															then: { $substrCP: [`$${sortField}`, 11, 8] },
+															else: '00:00:00',
+														},
+													},
+												],
+											},
+											else: `$${sortField}`,
+										},
+									},
+									else: `$${sortField}`,
+								},
+							},
+						},
 					});
+
+					pipeline.push({ $sort: { __parsedDate: sortDir } });
+					pipeline.push({ $project: { __parsedDate: 0 } });
+
+					if (Object.keys(projectStage).length > 0) {
+						pipeline.push({ $project: projectStage });
+					}
+
+					if (requestedSkip > 0) {
+						pipeline.push({ $skip: requestedSkip });
+					}
+
+					pipeline.push({ $limit: requestedLimit });
+
+					docs = await collection.aggregate(pipeline).toArray();
+				} else {
+					let cursor = collection.find(finalQuery);
+					if (Object.keys(projectStage).length > 0) {
+						cursor = cursor.project(projectStage);
+					}
+					if (requestedSkip > 0) {
+						cursor = cursor.skip(requestedSkip);
+					}
+					cursor = cursor.limit(requestedLimit);
+					docs = await cursor.toArray();
 				}
+
+				const cleanedDocs = docs.map(cleanBsonTypes);
 
 				const returnedCount = cleanedDocs.length;
 				const hasMore = requestedSkip + returnedCount < totalCount;
