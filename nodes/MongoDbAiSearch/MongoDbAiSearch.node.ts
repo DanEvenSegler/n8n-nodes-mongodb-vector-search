@@ -33,7 +33,7 @@ async function getMongoClient(node: any, credentials: IDataObject): Promise<Mong
 		} catch (e) {
 			try {
 				await clientCache[key].close();
-			} catch (_) {}
+			} catch (_) { }
 			delete clientCache[key];
 		}
 	}
@@ -196,7 +196,7 @@ function sanitizeSortDocument(sortObj: any): any {
 				}
 				const parsed = JSON.parse(trimmed);
 				return sanitizeSortDocument(parsed);
-			} catch (_) {}
+			} catch (_) { }
 		}
 		const cleanSort: any = {};
 		if (trimmed.startsWith('-')) {
@@ -767,6 +767,16 @@ export class MongoDbAiSearch implements INodeType {
 			`   - "sort": (optional object) MongoDB sort document on ANY field (e.g. {"${primaryDateField}": -1} for newest records, {"Prio": -1} for highest priority, {"ID": 1} for ID order, or any field name).`
 		);
 
+		let criticalRulesStr = `- The database contains ALL records in the collection (not limited to the schema overview).
+- Every query executes database-wide across 100% of all documents in MongoDB.`;
+
+		if (allowJoins) {
+			criticalRulesStr += `\n- FETCHING DATA FROM OTHER COLLECTIONS IN DATABASE "${dbName}":
+  1. If a dedicated tool exists for the target collection, use that dedicated tool first.
+  2. If NO dedicated tool exists for the target collection, do not search foreign IDs directly in this tool. Instead, pass "lookup" to perform a Left Outer Join with that target collection!
+  Example: {"filter": {"status": "active"}, "lookup": {"from": "<target_collection>", "localField": "<foreign_id_field>", "foreignField": "_id", "as": "joinedData"}}`;
+		}
+
 		// Tool Description (100% Universal English Prompt)
 		const autoDescription = `Use this tool to search, query, filter, group, aggregate, and inspect documents in the MongoDB collection "${collectionName}" (database: "${dbName}").
 
@@ -774,8 +784,7 @@ COLLECTION SCHEMA OVERVIEW:
 ${schemaAnalysis.summaryText}
 
 CRITICAL DATABASE SEARCH RULES:
-- The database contains ALL records in the collection (not limited to the schema overview).
-- Every query executes database-wide across 100% of all documents in MongoDB.
+${criticalRulesStr}
 
 FOR SINGLE RECORD OR DATE SEARCHES (NEWEST / OLDEST / LATEST):
 - Detected date/time fields for sorting in this collection: ${dateFieldsStr}
@@ -876,7 +885,7 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 						if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
 							try {
 								parsedFilter = JSON.parse(trimmed);
-							} catch (_) {}
+							} catch (_) { }
 						}
 					}
 					if (typeof parsedFilter === 'object' && parsedFilter !== null && Object.keys(parsedFilter).length > 0) {
@@ -900,8 +909,8 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 				const finalQuery = queryParts.length === 0
 					? {}
 					: queryParts.length === 1
-					? queryParts[0]
-					: { $and: queryParts };
+						? queryParts[0]
+						: { $and: queryParts };
 
 				// Build Projection
 				const projectStage: any = {};
