@@ -176,6 +176,130 @@ function extractQueryString(input: any): string {
 	return String(input);
 }
 
+function sanitizeToolName(name: string): string {
+	if (!name) return '';
+	return name
+		.trim()
+		.replace(/ä/g, 'ae')
+		.replace(/ö/g, 'oe')
+		.replace(/ü/g, 'ue')
+		.replace(/ß/g, 'ss')
+		.replace(/Ä/g, 'ae')
+		.replace(/Ö/g, 'oe')
+		.replace(/Ü/g, 'ue')
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, '_')
+		.replace(/_+/g, '_')
+		.replace(/^_|_$/g, '');
+}
+
+interface SchemaFieldInfo {
+	name: string;
+	types: Set<string>;
+	sampleValues: Set<string>;
+}
+
+async function analyzeCollectionSchema(
+	collection: any,
+	sampleCount: number = 50,
+	projectionMode: string = 'all',
+	fieldsToInclude: string = '',
+	fieldsToExclude: string = '',
+	excludeId: boolean = false,
+	excludeEmbedding: boolean = false,
+	embeddingField: string = '',
+	maxSchemaSampleLength: number = 60,
+	maxSampleValuesPerField: number = 3
+): Promise<{ fields: SchemaFieldInfo[]; summaryText: string; stringFields: string[] }> {
+	let sampleDocs: any[] = [];
+	try {
+		sampleDocs = await collection.find({}).sort({ _id: -1 }).limit(sampleCount).toArray();
+	} catch (_) {}
+
+	const fieldMap: { [fieldName: string]: SchemaFieldInfo } = {};
+
+	const includeSet = new Set(
+		fieldsToInclude
+			.split(',')
+			.map((f) => f.trim())
+			.filter((f) => f !== '')
+	);
+
+	const excludeSet = new Set(
+		fieldsToExclude
+			.split(',')
+			.map((f) => f.trim())
+			.filter((f) => f !== '')
+	);
+
+	for (const rawDoc of sampleDocs) {
+		const doc = cleanBsonTypes(rawDoc);
+		for (const [key, value] of Object.entries(doc)) {
+			if (key === '_id' && excludeId) continue;
+			if (embeddingField && key === embeddingField && excludeEmbedding) continue;
+			if (projectionMode === 'include' && includeSet.size > 0 && !includeSet.has(key) && key !== '_id') continue;
+			if (projectionMode === 'exclude' && excludeSet.has(key)) continue;
+
+			if (!fieldMap[key]) {
+				fieldMap[key] = {
+					name: key,
+					types: new Set(),
+					sampleValues: new Set(),
+				};
+			}
+
+			if (value === null || value === undefined) {
+				fieldMap[key].types.add('null');
+			} else if (Array.isArray(value)) {
+				fieldMap[key].types.add('array');
+			} else if (typeof value === 'object') {
+				fieldMap[key].types.add('object');
+			} else if (typeof value === 'number') {
+				fieldMap[key].types.add('number');
+			} else if (typeof value === 'boolean') {
+				fieldMap[key].types.add('boolean');
+			} else if (value instanceof Date) {
+				fieldMap[key].types.add('date');
+			} else if (typeof value === 'string') {
+				const trimmedVal = value.trim();
+				if (/^\d{4}-\d{2}-\d{2}/.test(trimmedVal) || /^\d{1,2}\.\d{1,2}\.\d{4}/.test(trimmedVal)) {
+					fieldMap[key].types.add('date');
+				} else {
+					fieldMap[key].types.add('string');
+				}
+				if (trimmedVal !== '' && fieldMap[key].sampleValues.size < maxSampleValuesPerField) {
+					const sample = maxSchemaSampleLength > 0 && trimmedVal.length > maxSchemaSampleLength
+						? trimmedVal.substring(0, maxSchemaSampleLength) + '...'
+						: trimmedVal;
+					fieldMap[key].sampleValues.add(sample);
+				}
+			} else {
+				fieldMap[key].types.add(typeof value);
+			}
+		}
+	}
+
+	const fields = Object.values(fieldMap);
+	const stringFields = fields.filter((f) => f.types.has('string')).map((f) => f.name);
+
+	const summaryLines: string[] = [];
+	for (const f of fields) {
+		const typeStr = Array.from(f.types).join('|');
+		let samples = '';
+		if (f.sampleValues.size > 0) {
+			const sampleList = Array.from(f.sampleValues).map((s) => `"${s}"`).join(', ');
+			samples = ` (Sample values: ${sampleList})`;
+		}
+		summaryLines.push(`  - "${f.name}": [Type: ${typeStr}]${samples}`);
+	}
+
+	const summaryText = summaryLines.length > 0
+		? summaryLines.join('\n')
+		: '  (No sample documents found in collection to analyze schema)';
+
+	return { fields, summaryText, stringFields };
+}
+
 export interface MongoDbVectorStoreOptions {
 	embeddings: EmbeddingsInterface;
 	db: any;
@@ -744,6 +868,17 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 						placeholder: 'Use this tool to search the MongoDB vector database for relevant documents based on semantic similarity...',
 						description: 'Custom description explaining to the AI Agent when and how to call this tool. If left empty, a description will be automatically generated from your database, collection, and field settings.',
 					},
+					{
+						displayName: 'Additional Description',
+						name: 'additionalDescription',
+						type: 'string',
+						typeOptions: {
+							rows: 4,
+						},
+						default: '',
+						placeholder: 'Use this collection to find semantically relevant employee records...',
+						description: 'Additional business context or usage instructions to append to the dynamically generated tool description (without overwriting the auto-generated schema overview).',
+					},
 				],
 			},
 		],
@@ -925,6 +1060,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		}
 
 		const db = client.db(dbName);
+		const collection = db.collection(collectionName);
 
 		const projectionMode = this.getNodeParameter('projectionMode', itemIndex, 'all') as string;
 		const fieldsToInclude = this.getNodeParameter('fieldsToInclude', itemIndex, '') as string;
@@ -932,40 +1068,59 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 		const excludeEmbedding = this.getNodeParameter('excludeEmbedding', itemIndex, false) as boolean;
 		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
 
-		// Auto-generate tool name based on collection name if not specified by user
-		const sanitizedCol = (collectionName || 'vector_db')
-			.toLowerCase()
-			.replace(/[^a-z0-9_]/g, '_')
-			.replace(/_+/g, '_')
-			.replace(/^_|_$/g, '');
+		// Perform schema discovery analysis on collection
+		const schemaAnalysis = await analyzeCollectionSchema(
+			collection,
+			50,
+			projectionMode,
+			fieldsToInclude,
+			fieldsToExclude,
+			excludeId,
+			excludeEmbedding,
+			embeddingField
+		);
+
+		// Auto-generate tool name with German Umlaut Transliteration based on collection name if not specified by user
+		const sanitizedCol = sanitizeToolName(collectionName || 'mongodb_collection');
 		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'mongodb_vector_search';
 
 		const toolNameRaw = (nodeOptions.toolName as string) || '';
 		const toolName = toolNameRaw.trim() !== ''
-			? toolNameRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
+			? sanitizeToolName(toolNameRaw)
 			: autoToolName;
 
 		// Auto-generate tool description based on dropdowns and field settings if not specified by user
 		const textInfo = textField && textField.trim() !== '' ? ` (primary text field: "${textField.trim()}")` : '';
 		const filterInfo = filterRaw && filterRaw.trim() !== '' ? `\nPre-filter pre-configured: ${filterRaw.trim()}` : '';
 		const postFilterInfo = postFilterRaw && postFilterRaw.trim() !== '' ? `\nPost-filter pre-configured: ${postFilterRaw.trim()}` : '';
-		
-		const autoDescription = `Use this tool to search for documents, records, business partners, or information in the MongoDB collection "${collectionName}" (database: "${dbName}")${textInfo}.${filterInfo}${postFilterInfo}
-This tool performs a high-precision semantic vector search using index "${indexName}".
 
-WHEN TO USE:
-- Always call this tool when answering questions about entities, partners, products, or documents stored in MongoDB.
+		const autoDescription = `Use this tool to search for semantically relevant documents, records, business partners, or information in the MongoDB collection "${collectionName}" (database: "${dbName}", vector index: "${indexName}")${textInfo}.${filterInfo}${postFilterInfo}
 
-HOW TO CALL:
-- Option A (Simple): Pass a clear search query string describing what you want to find (e.g., "Reichelt" or "Elektronik").
-- Option B (Structured JSON): Pass a JSON string/object with options:
-  * "query": (required string) search text prompt
-  * "filter": (optional object) pre-filter evaluated inside $vectorSearch
-  * "postFilter": (optional object) post-filter evaluated in $match stage after vector search
-  * "limit": (optional number) max results to return (default: ${limit})`;
+COLLECTION SCHEMA OVERVIEW:
+${schemaAnalysis.summaryText}
+
+WHEN TO USE THIS TOOL:
+- Call this tool when answering questions, finding documents, or searching semantically for records stored in collection "${collectionName}".
+
+HOW TO CALL THIS TOOL:
+1. Plain Text Semantic Search (Recommended):
+   Pass a clear search query string describing what you want to find (e.g. "Reichelt" or "active contracts"). The tool will perform a semantic vector search.
+
+2. Structured JSON Query (With Metadata Filtering):
+   Pass a JSON object with any of the following parameters:
+   - "query": (required string) search text prompt for semantic vector search
+   - "filter": (optional object) MongoDB pre-filter object evaluated inside $vectorSearch stage
+   - "postFilter": (optional object) MongoDB post-filter evaluated in $match stage after vector search
+   - "limit": (optional number) max results to return (default: ${limit})`;
 
 		const toolDescriptionRaw = (nodeOptions.toolDescription as string) || '';
-		const toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
+		const additionalDescriptionRaw = (nodeOptions.additionalDescription as string) || '';
+
+		let toolDescription = toolDescriptionRaw.trim() !== '' ? toolDescriptionRaw.trim() : autoDescription;
+
+		if (toolDescriptionRaw.trim() === '' && additionalDescriptionRaw.trim() !== '') {
+			toolDescription += `\n\nADDITIONAL BUSINESS CONTEXT & USAGE INSTRUCTIONS:\n${additionalDescriptionRaw.trim()}`;
+		}
 
 		const vectorStore = new MongoDbAtlasVectorStore({
 			embeddings: embedder,

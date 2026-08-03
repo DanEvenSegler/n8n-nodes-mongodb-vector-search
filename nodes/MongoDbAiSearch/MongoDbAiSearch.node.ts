@@ -1185,12 +1185,12 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 		};
 
 		const aiSearchSchema = z.object({
-			query: z.string().optional().describe('Text search prompt to fuzzy match fields or search query (e.g. "Reichelt" or "Elektronik")'),
+			query: z.string().optional().describe('Text search prompt to fuzzy match fields or search query (e.g. "Company name" or "Electronics")'),
 			filter: z.union([z.record(z.any()), z.string()]).optional().describe('MongoDB query filter object matching schema fields. Example: {"status": "active"}'),
 			id: z.string().optional().describe('Exact MongoDB document ID (_id)'),
 			skip: z.number().optional().describe('Number of records to skip for pagination (default: 0)'),
 			limit: z.number().optional().describe('Number of records to return (default: 10)'),
-			sort: z.union([z.record(z.any()), z.string(), z.array(z.any())]).optional().describe('MongoDB sort document. Example: {"Geändert": -1} for newest modified records first, or {"createdAt": 1} for oldest first.'),
+			sort: z.union([z.record(z.any()), z.string(), z.array(z.any())]).optional().describe('MongoDB sort document. Example: {"modifiedDate": -1} for newest modified records first, or {"createdAt": 1} for oldest first.'),
 		});
 
 		const tool = new DynamicStructuredTool({
