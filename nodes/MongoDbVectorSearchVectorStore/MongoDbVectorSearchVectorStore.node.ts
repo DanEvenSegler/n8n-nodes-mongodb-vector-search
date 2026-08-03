@@ -1082,7 +1082,7 @@ export class MongoDbVectorSearchVectorStore implements INodeType {
 
 		// Auto-generate tool name with German Umlaut Transliteration based on collection name if not specified by user
 		const sanitizedCol = sanitizeToolName(collectionName || 'mongodb_collection');
-		const autoToolName = sanitizedCol ? `search_${sanitizedCol}` : 'mongodb_vector_search';
+		const autoToolName = sanitizedCol ? `vector_search_${sanitizedCol}` : 'mongodb_vector_search';
 
 		const toolNameRaw = (nodeOptions.toolName as string) || '';
 		const toolName = toolNameRaw.trim() !== ''
