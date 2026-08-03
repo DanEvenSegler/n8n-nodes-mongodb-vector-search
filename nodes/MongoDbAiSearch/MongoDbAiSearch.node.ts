@@ -158,6 +158,7 @@ function cleanFieldName(name: string): string {
 }
 
 function truncateStringValue(str: string, maxLength: number = 300): string {
+	if (maxLength <= 0) return str;
 	if (!str || str.length <= maxLength) return str;
 	const clean = str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 	if (clean.length <= maxLength) return clean;
@@ -303,7 +304,10 @@ async function analyzeCollectionSchema(
 	projectionMode: string = 'all',
 	fieldsToInclude: string = '',
 	fieldsToExclude: string = '',
-	excludeId: boolean = false
+	fieldsToExcludeFromSchema: string = '',
+	excludeId: boolean = false,
+	maxSchemaSampleLength: number = 60,
+	maxSampleValuesPerField: number = 3
 ): Promise<{ fields: SchemaFieldInfo[]; summaryText: string; stringFields: string[] }> {
 	const sampleDocs = await collection.find({}).sort({ _id: -1 }).limit(sampleCount).toArray();
 	const fieldMap: { [fieldName: string]: SchemaFieldInfo } = {};
@@ -322,12 +326,22 @@ async function analyzeCollectionSchema(
 			.filter((f) => f !== '')
 	);
 
+	const schemaExcludeSet = new Set(
+		[
+			...fieldsToExclude.split(','),
+			...fieldsToExcludeFromSchema.split(','),
+		]
+			.map((f) => f.trim())
+			.filter((f) => f !== '')
+	);
+
 	for (const rawDoc of sampleDocs) {
 		const doc = cleanBsonTypes(rawDoc);
 		for (const [key, value] of Object.entries(doc)) {
 			if (key === '_id' && excludeId) continue;
 			if (projectionMode === 'include' && includeSet.size > 0 && !includeSet.has(key) && key !== '_id') continue;
 			if (projectionMode === 'exclude' && excludeSet.has(key)) continue;
+			if (schemaExcludeSet.has(key)) continue;
 
 			if (!fieldMap[key]) {
 				fieldMap[key] = {
@@ -356,8 +370,11 @@ async function analyzeCollectionSchema(
 				} else {
 					fieldMap[key].types.add('string');
 				}
-				if (trimmedVal !== '' && fieldMap[key].sampleValues.size < 5) {
-					fieldMap[key].sampleValues.add(trimmedVal);
+				if (trimmedVal !== '' && fieldMap[key].sampleValues.size < maxSampleValuesPerField) {
+					const sample = maxSchemaSampleLength > 0 && trimmedVal.length > maxSchemaSampleLength
+						? trimmedVal.substring(0, maxSchemaSampleLength) + '...'
+						: trimmedVal;
+					fieldMap[key].sampleValues.add(sample);
 				}
 			} else {
 				fieldMap[key].types.add(typeof value);
@@ -488,6 +505,14 @@ export class MongoDbAiSearch implements INodeType {
 				description: 'Comma-separated list of fields to exclude from both schema analysis and AI Agent outputs.',
 			},
 			{
+				displayName: 'Fields to Exclude from Tool Description Only',
+				name: 'fieldsToExcludeFromSchema',
+				type: 'string',
+				default: '',
+				placeholder: 'large_payload, raw_html, internal_data',
+				description: 'Comma-separated list of fields to hide from the AI Tool Description / Schema analysis (saving prompt tokens), but STILL include in query output results.',
+			},
+			{
 				displayName: 'Exclude ID Field (_id)',
 				name: 'excludeId',
 				type: 'boolean',
@@ -555,6 +580,27 @@ export class MongoDbAiSearch implements INodeType {
 						type: 'number',
 						default: 50,
 						description: 'Number of sample documents to inspect for automatic schema and categorical value analysis.',
+					},
+					{
+						displayName: 'Max Schema Sample Value Length',
+						name: 'maxSchemaSampleLength',
+						type: 'number',
+						default: 60,
+						description: 'Maximum character length for sample values shown in the AI Tool Description. Longer values are truncated to drastically cut token consumption.',
+					},
+					{
+						displayName: 'Max Sample Values per Field',
+						name: 'maxSampleValuesPerField',
+						type: 'number',
+						default: 3,
+						description: 'Maximum number of sample values to include per field in the AI Tool Description schema overview.',
+					},
+					{
+						displayName: 'Max Output String Length in AI Results',
+						name: 'maxOutputStringLength',
+						type: 'number',
+						default: 300,
+						description: 'Maximum character length per string field returned to the AI Agent in search results to prevent context window overflow (set to 0 for unlimited).',
 					},
 					{
 						displayName: 'Allow Cross-Collection Joins ($lookup)',
@@ -684,6 +730,7 @@ export class MongoDbAiSearch implements INodeType {
 		const projectionMode = this.getNodeParameter('projectionMode', itemIndex, 'all') as string;
 		const fieldsToInclude = this.getNodeParameter('fieldsToInclude', itemIndex, '') as string;
 		const fieldsToExclude = this.getNodeParameter('fieldsToExclude', itemIndex, '') as string;
+		const fieldsToExcludeFromSchema = this.getNodeParameter('fieldsToExcludeFromSchema', itemIndex, '') as string;
 		const excludeId = this.getNodeParameter('excludeId', itemIndex, false) as boolean;
 
 		const defaultLimit = this.getNodeParameter('limit', itemIndex, 10) as number;
@@ -693,6 +740,16 @@ export class MongoDbAiSearch implements INodeType {
 		const sampleCount = nodeOptions.hasOwnProperty('sampleDocumentCount')
 			? (nodeOptions.sampleDocumentCount as number)
 			: 50;
+
+		const maxSchemaSampleLength = nodeOptions.hasOwnProperty('maxSchemaSampleLength')
+			? (nodeOptions.maxSchemaSampleLength as number)
+			: 60;
+		const maxSampleValuesPerField = nodeOptions.hasOwnProperty('maxSampleValuesPerField')
+			? (nodeOptions.maxSampleValuesPerField as number)
+			: 3;
+		const maxOutputStringLength = nodeOptions.hasOwnProperty('maxOutputStringLength')
+			? (nodeOptions.maxOutputStringLength as number)
+			: 300;
 
 		const allowJoins = nodeOptions.hasOwnProperty('allowJoins') ? (nodeOptions.allowJoins as boolean) : true;
 		const allowAggregations = nodeOptions.hasOwnProperty('allowAggregations') ? (nodeOptions.allowAggregations as boolean) : true;
@@ -709,7 +766,10 @@ export class MongoDbAiSearch implements INodeType {
 			projectionMode,
 			fieldsToInclude,
 			fieldsToExclude,
-			excludeId
+			fieldsToExcludeFromSchema,
+			excludeId,
+			maxSchemaSampleLength,
+			maxSampleValuesPerField
 		);
 
 		// Tool Name Generation with German Umlaut Transliteration
@@ -1085,7 +1145,7 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 				}
 
 				const cleanedDocs = docs.map(cleanBsonTypes);
-				const llmSafeDocs = cleanedDocs.map((d) => sanitizeDocForLlm(d, 300));
+				const llmSafeDocs = cleanedDocs.map((d) => sanitizeDocForLlm(d, maxOutputStringLength));
 
 				const returnedCount = llmSafeDocs.length;
 				const hasMore = requestedSkip + returnedCount < totalCount;
@@ -1175,21 +1235,37 @@ If "hasMore" is true, inform the user how many total records exist (e.g., "Found
 				const projectionMode = this.getNodeParameter('projectionMode', i, 'all') as string;
 				const fieldsToInclude = this.getNodeParameter('fieldsToInclude', i, '') as string;
 				const fieldsToExclude = this.getNodeParameter('fieldsToExclude', i, '') as string;
+				const fieldsToExcludeFromSchema = this.getNodeParameter('fieldsToExcludeFromSchema', i, '') as string;
 				const excludeId = this.getNodeParameter('excludeId', i, false) as boolean;
 
 				const defaultLimit = this.getNodeParameter('limit', i, 10) as number;
 				const maxLimit = this.getNodeParameter('maxLimit', i, 50) as number;
+
+				const nodeOptions = this.getNodeParameter('options', i, {}) as IDataObject;
+				const sampleCount = nodeOptions.hasOwnProperty('sampleDocumentCount')
+					? (nodeOptions.sampleDocumentCount as number)
+					: 50;
+
+				const maxSchemaSampleLength = nodeOptions.hasOwnProperty('maxSchemaSampleLength')
+					? (nodeOptions.maxSchemaSampleLength as number)
+					: 60;
+				const maxSampleValuesPerField = nodeOptions.hasOwnProperty('maxSampleValuesPerField')
+					? (nodeOptions.maxSampleValuesPerField as number)
+					: 3;
 
 				const db = client.db(dbName);
 				const collection = db.collection(collectionName);
 
 				const schemaAnalysis = await analyzeCollectionSchema(
 					collection,
-					50,
+					sampleCount,
 					projectionMode,
 					fieldsToInclude,
 					fieldsToExclude,
-					excludeId
+					fieldsToExcludeFromSchema,
+					excludeId,
+					maxSchemaSampleLength,
+					maxSampleValuesPerField
 				);
 
 				const inputItem = items[i].json;
